@@ -10,6 +10,7 @@ unavailable or returns an invalid plan.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -22,6 +23,8 @@ from agentic_gis.config.registry import DatasetRegistry, DatasetSpec
 from agentic_gis.security.policy import DataEgressPolicy
 from agentic_gis.security.sanitize import clean_text, wrap_untrusted
 from agentic_gis.spatial.operations import normalize_name
+
+log = logging.getLogger(__name__)
 
 BOROUGH_DISPLAY = {
     "MANHATTAN": "Manhattan",
@@ -666,7 +669,7 @@ class RulePlanner:
 # =========================================================================================
 # LLM planner prompt
 # =========================================================================================
-def dataset_digest(ds: DatasetSpec, level: str) -> str:
+def dataset_digest(ds: DatasetSpec, level: str, live_columns: list[Any] | None = None) -> str:
     if level == "name_only":
         return f"- {ds.id}: {ds.label} [{ds.role}] (details withheld by data policy)"
     geom = ds.spatial.geometry_type if ds.spatial else "none"
@@ -682,6 +685,13 @@ def dataset_digest(ds: DatasetSpec, level: str) -> str:
         if cats:
             parts.append(f"    categories: {', '.join(cats[:20])}")
         cols = [f"{c.name}({c.type})" for c in ds.columns if not c.sensitive and c.type != "geometry"][:25]
+        if not cols and live_columns:
+            sensitive = ds.sensitive_columns
+            cols = [
+                f"{clean_text(c.name, 64)[0]}({clean_text(c.type, 32)[0]})"
+                for c in live_columns
+                if c.name.lower() not in sensitive
+            ][:40]
         if cols:
             parts.append(f"    columns: {', '.join(cols)}")
         if ds.name_column:
@@ -702,7 +712,17 @@ def build_planner_prompt(
 ) -> str:
     from agentic_gis.agent.prompts import PLANNER_USER
 
-    datasets = "\n".join(dataset_digest(d, policy.dataset_level(d)) for d in registry.available(mode))
+    digests = []
+    for d in registry.available(mode):
+        level = policy.dataset_level(d)
+        live = None
+        if level == "full" and d.schema_discovery and not d.columns and ctx is not None:
+            try:  # Unity Catalog metadata lookup (cached per session); never reads table rows
+                live = ctx.columns_for(d)
+            except Exception as exc:  # permission or connectivity problems: plan without columns
+                log.info("Schema discovery for %s failed: %s", d.id, exc)
+        digests.append(dataset_digest(d, level, live))
+    datasets = "\n".join(digests)
     ctx_lines = []
     if context.get("last_question"):
         prev = {

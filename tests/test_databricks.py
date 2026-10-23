@@ -195,3 +195,40 @@ def test_live_databricks_connection():
     st = Settings()
     status = DatabricksConnector(st).test_connection()
     assert status.ok, status.message
+
+
+def test_llm_prompt_includes_discovered_uc_columns(tmp_path, registry, sr311):
+    import json
+
+    from tests.fakes.fake_ollama import FakeOllama
+
+    spec = DatasetSpec(
+        id="dsny_discovered",
+        name="Discovered UC table",
+        description="schema discovered at runtime",
+        backend="databricks",
+        modes=["databricks"],
+        role="events",
+        sensitivity="internal",
+        source=SourceSpec(type="databricks_table", table=FQ),
+        schema_discovery=True,
+    )
+    reg = DatasetRegistry([*registry.all(), spec], registry.geographies)
+    st = dbx_settings(tmp_path, llm_provider="ollama")
+    conn = FakeConnection({FQ: sr311})
+    from agentic_gis.connectors.duckdb_engine import LocalDuckDBEngine
+
+    engines = {
+        "local": LocalDuckDBEngine(reg, "databricks"),
+        "databricks": DatabricksConnector(st, connect_fn=connect_factory(conn)),
+    }
+    fake = FakeOllama(
+        [json.dumps({"interpretation": "x", "steps": [], "clarification": "Which columns matter?"})]
+    )
+    rt = create_runtime(st, mode="databricks", engines=engines, registry=reg, llm_transport=fake.transport())
+    r = AgentSession(rt).ask("What is in the discovered table?")
+    assert r.status == "clarification"
+    prompt = fake.requests[0]["messages"][1]["content"]
+    assert "complaint_type(" in prompt and "incident_address(" in prompt
+    assert "ignore previous instructions" not in prompt.lower()
+    assert not any("SELECT" in sql and "current_user" not in sql for sql, _ in conn.executed), "no row reads"

@@ -15,6 +15,7 @@ Add a tool by calling :meth:`ToolRegistry.register` (see ``docs/EXTENDING.md``).
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -317,6 +318,24 @@ class ToolSpec:
         return out
 
 
+def _schema_type(prop: dict[str, Any], defs: dict[str, Any]) -> str:
+    if "$ref" in prop:
+        name = prop["$ref"].split("/")[-1]
+        target = defs.get(name, {})
+        fields = ", ".join(target.get("properties", {}))
+        return f"{name}{{{fields}}}"
+    if "enum" in prop:
+        return "one of " + "|".join(str(v) for v in prop["enum"])
+    if "anyOf" in prop:
+        opts = [_schema_type(o, defs) for o in prop["anyOf"] if o.get("type") != "null"]
+        return " or ".join(opts) if opts else "any"
+    if prop.get("type") == "array":
+        return f"list[{_schema_type(prop.get('items', {}), defs)}]"
+    return {"string": "str", "integer": "int", "number": "number", "boolean": "bool", "object": "object"}.get(
+        str(prop.get("type")), "any"
+    )
+
+
 class UnknownToolError(KeyError):
     pass
 
@@ -362,15 +381,23 @@ class ToolRegistry:
         return spec.args_model.model_validate(args or {})
 
     def catalog_for_prompt(self, ctx: ToolContext | None = None) -> str:
+        """Compact, model-friendly signatures derived from each tool's JSON schema."""
         lines = []
         for t in self.specs(ctx):
+            schema = t.args_model.model_json_schema()
+            defs = schema.get("$defs", {})
+            required = set(schema.get("required", []))
             params = []
-            for fname, f in t.args_model.model_fields.items():
-                ann = getattr(f.annotation, "__name__", None) or str(f.annotation).replace("typing.", "")
-                ann = re.sub(r"<class '([^']+)'>", r"\1", ann)
-                default = "" if f.is_required() else f"={f.default!r}" if f.default is not None else "=None"
-                desc = f" -- {f.description}" if f.description else ""
-                params.append(f"    {fname}: {ann}{default}{desc}")
+            for fname, prop in schema.get("properties", {}).items():
+                typ = _schema_type(prop, defs)
+                if fname in required:
+                    default = ""
+                elif "default" in prop:
+                    default = f" = {json.dumps(prop['default'])}"
+                else:
+                    default = " (optional)"
+                desc = f" -- {prop['description']}" if prop.get("description") else ""
+                params.append(f"    {fname}: {typ}{default}{desc}")
             lines.append(f"- {t.name}: {t.description}\n" + "\n".join(params))
         return "\n".join(lines)
 
