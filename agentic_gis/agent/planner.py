@@ -283,7 +283,7 @@ class RulePlanner:
                     it.reference_dataset = streets_ds.id
         else:
             it.subject_dataset = it.event_dataset or next(
-                iter(sorted(mention_pos, key=mention_pos.get)), None
+                iter(sorted(mention_pos, key=lambda k: mention_pos[k])), None
             )
         it.categories = cats_by_ds.get(it.subject_dataset or "", [])
         it.reference_categories = cats_by_ds.get(it.reference_dataset or "", [])
@@ -620,18 +620,14 @@ class RulePlanner:
             )
             add("generate_map_layer", "Map totals", input=s3, color_by="value")
             interp = f"Describe how {topic} changed over time ({where})" + (f", by {group}" if group else "")
-        elif a == "by_street":
+        elif a == "by_street" and it.reference_dataset:
             ref = it.reference_dataset
             s1 = subject_input(f"Select {topic} ({where})")
-            s2 = (
-                load(
-                    ref,
-                    "Load street segments",
-                    with_filters=False,
-                    boroughs=[BOROUGH_DISPLAY.get(b, b) for b in it.boroughs] or None,
-                )
-                if ref
-                else None
+            s2 = load(
+                ref,
+                "Load street segments",
+                with_filters=False,
+                boroughs=[BOROUGH_DISPLAY.get(b, b) for b in it.boroughs] or None,
             )
             min_v = it.min_points or 3
             s3 = add(

@@ -64,8 +64,8 @@ def tile_grid(
         raise ValueError(
             f"{nx * ny:,} tiles exceed the limit of {max_tiles:,}; use a larger tile size or smaller area"
         )
-    ix, iy = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
-    ix, iy = ix.ravel(), iy.ravel()
+    gx, gy = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+    ix, iy = gx.ravel(), gy.ravel()
     x0 = minx + ix * size
     y0 = miny + iy * size
     geoms = shapely.box(x0, y0, x0 + size, y0 + size)

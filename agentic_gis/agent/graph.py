@@ -41,7 +41,7 @@ from agentic_gis.agent.planner import RulePlanner, Vocabulary, build_planner_pro
 from agentic_gis.agent.prompts import NARRATOR_SYSTEM, NARRATOR_USER, PLANNER_SYSTEM
 from agentic_gis.agent.state import AgentState, Answer, Plan
 from agentic_gis.agent.tools import ToolContext, ToolRegistry, build_default_registry
-from agentic_gis.agent.workspace import ResultStore
+from agentic_gis.agent.workspace import Artifact, ResultStore
 from agentic_gis.config.registry import DatasetRegistry, DatasetSpec, UnknownDatasetError, load_registry
 from agentic_gis.config.settings import Settings, get_settings
 from agentic_gis.connectors.base import QueryEngine
@@ -140,7 +140,8 @@ def build_vocabulary(ctx: ToolContext, registry: DatasetRegistry, mode: str) -> 
     for ds in registry.available(mode):
         if ds.role != "streets" or not ds.name_column:
             continue
-        values = ds.column(ds.name_column).known_values if ds.column(ds.name_column) else []
+        name_col = ds.column(ds.name_column)
+        values = list(name_col.known_values) if name_col is not None else []
         if not values and ds.backend == "local":
             try:
                 g = ctx.load_reference(ds)
@@ -543,7 +544,7 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
         trace = list(state.get("trace", []))
         for step in p.steps:
             spec = rt.tools.get(step.tool)
-            deps = [step.args.get(f) for f in spec.ref_fields if step.args.get(f) in step_ids]
+            deps = [str(step.args[f]) for f in spec.ref_fields if step.args.get(f) in step_ids]
             rec: dict[str, Any] = {
                 "step_id": step.id,
                 "tool": step.tool,
@@ -624,8 +625,10 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
     def finalize(state: AgentState) -> dict[str, Any]:
         turn = state["turn"]
         steps = state.get("steps", [])
-        arts = [rt.store.get(s["artifact_id"]) for s in steps if s.get("artifact_id") and s["status"] == "ok"]
-        arts = [a for a in arts if a is not None and a.turn == turn]
+        arts_raw = [
+            rt.store.get(s["artifact_id"]) for s in steps if s.get("artifact_id") and s["status"] == "ok"
+        ]
+        arts: list[Artifact] = [a for a in arts_raw if a is not None and a.turn == turn]
         primary = None
         for s in reversed(steps):
             a = rt.store.get(s.get("artifact_id") or "")
@@ -812,7 +815,7 @@ class TurnResult:
     elapsed_s: float = 0.0
 
 
-PER_TURN_RESET = {
+PER_TURN_RESET: dict[str, Any] = {
     "plan": None,
     "plan_source": "",
     "intent": None,

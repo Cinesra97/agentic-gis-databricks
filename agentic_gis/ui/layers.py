@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
+import shapely
 from pydantic import BaseModel, Field
 
 RenderKind = Literal["points", "cluster", "heatmap", "choropleth", "lines", "polygons"]
@@ -32,6 +33,11 @@ OTHER_GRAY = "#898781"
 SEQUENTIAL = {
     "light": ["#b7d3f6", "#6da7ec", "#3987e5", "#1c5cab", "#0d366b"],
     "dark": ["#104281", "#256abf", "#3987e5", "#6da7ec", "#b7d3f6"],
+}
+# Ordinal variant for thin marks (lines, markers): the lowest step still clears 2:1 against the surface.
+SEQUENTIAL_ORDINAL = {
+    "light": ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#0d366b"],
+    "dark": ["#256abf", "#3987e5", "#6da7ec", "#9ec5f4", "#cde2fb"],
 }
 # Diverging: blue (negative / cold) <- neutral gray -> red (positive / hot); 3 steps per arm.
 DIVERGING = {
@@ -73,6 +79,8 @@ class LayerStyle(BaseModel):
     breaks: list[float] = Field(default_factory=list, description="Upper class bounds for numeric classes")
     categories: list[str] = Field(default_factory=list, description="Ordered category values (max 3 + Other)")
     radius: float = 5.0
+    size_by: str | None = Field(None, description="Numeric column scaling marker radius (points / centroids)")
+    size_range: list[float] = Field(default_factory=lambda: [5.0, 16.0])
     weight: float = 2.0
     opacity: float = 0.9
     fill_opacity: float = 0.6
@@ -105,7 +113,11 @@ def layer_json_schema() -> dict[str, Any]:
 
 
 # ---- color resolution ------------------------------------------------------------------
-def resolve_role(role: str, theme: Theme) -> str:
+def uses_ordinal(spec: MapLayerSpec) -> bool:
+    return spec.geometry_kind in ("line", "point") or spec.render == "points"
+
+
+def resolve_role(role: str, theme: Theme, ordinal: bool = False) -> str:
     kind, *rest = role.split(":")
     if kind == "single":
         return SINGLE[theme]
@@ -118,12 +130,14 @@ def resolve_role(role: str, theme: Theme) -> str:
         pal = CATEGORICAL[theme]
         return pal[i] if i < len(pal) else OTHER_GRAY
     if kind == "seq":
-        pal = SEQUENTIAL[theme]
+        pal = (SEQUENTIAL_ORDINAL if ordinal else SEQUENTIAL)[theme]
         return pal[min(int(rest[0]), len(pal) - 1)]
     if kind == "div":
         side, i = rest[0], int(rest[1]) if len(rest) > 1 else 0
         d = DIVERGING[theme]
-        return d["mid"] if side == "mid" else d[side][min(i, 2)]
+        if side == "mid":
+            return str(d["mid"])
+        return str(d[side][min(i, 2)])
     return SINGLE[theme]
 
 
@@ -190,12 +204,13 @@ def _diverging_breaks(values: pd.Series) -> list[float]:
     v = pd.to_numeric(values, errors="coerce").dropna()
     pos, neg = v[v > 0], v[v < 0]
     out: list[float] = []
+    integer = bool(len(v)) and np.allclose(v, np.round(v))
     if len(neg):
-        qn = np.unique(np.quantile(neg, [1 / 3, 2 / 3, 1.0]))
-        out += [float(x) for x in qn]  # ascending; most negative class first
+        qn = np.quantile(neg, [1 / 3, 2 / 3, 1.0])
+        out += [float(x) for x in np.unique(np.round(qn) if integer else qn)]  # most negative class first
     if len(pos):
-        qp = np.unique(np.quantile(pos, [1 / 3, 2 / 3, 1.0]))
-        out += [float(x) for x in qp]
+        qp = np.quantile(pos, [1 / 3, 2 / 3, 1.0])
+        out += [float(x) for x in np.unique(np.round(qp) if integer else qp)]
     return out
 
 
@@ -226,6 +241,15 @@ def build_layer_spec(
             style = "choropleth" if (color_by or _default_value_column(cols)) and not context else "polygons"
     if style == "heatmap" and kind != "point":
         style = "polygons" if kind == "polygon" else "lines"
+    small_polys = False
+    if kind == "polygon" and style in ("choropleth", "polygons") and not context and artifact.rows:
+        b = artifact.bounds
+        if b:
+            extent = max((b[2] - b[0]) * (b[3] - b[1]), 1e-9)
+            coverage = float(np.nansum(shapely.area(gdf.geometry.values))) / extent  # relative, in degrees²
+            # Sparse, tiny areas (e.g. 75 ft repeat-report clusters) vanish at city scale; tessellations
+            # such as grid cells or neighborhoods cover far more of the extent and stay as polygons.
+            small_polys = coverage < 0.005 and artifact.rows > 3
 
     st = LayerStyle()
     legend: list[LegendItem] = []
@@ -298,6 +322,21 @@ def build_layer_spec(
         if style in ("choropleth", "polygons"):
             st.fill_opacity = 0.65 if st.color_role != "single" else 0.35
     st.color_by = color_by
+    if small_polys:
+        # Small areas (e.g. repeat-report clusters) are drawn as markers at their centroids so they stay
+        # visible at city scale; marker size follows the value as a second encoding.
+        style = "points"
+        st.radius = 7.0
+        if color_by and color_by in gdf.columns and pd.api.types.is_numeric_dtype(gdf[color_by]):
+            st.size_by = color_by
+    elif (
+        style == "points"
+        and not context
+        and color_by
+        and color_by in gdf.columns
+        and pd.api.types.is_numeric_dtype(gdf[color_by])
+    ):
+        st.size_by = color_by
     note = None
     if style in ("points", "cluster") and artifact.rows > max_render_features:
         note = (

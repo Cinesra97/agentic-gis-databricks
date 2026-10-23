@@ -45,7 +45,7 @@ from agentic_gis.ui.layers import build_layer_spec
 log = logging.getLogger(__name__)
 
 Unit = Literal["ft", "m", "km", "mi", "yd", "block"]
-REF = {"x-ref": True}
+REF: Any = {"x-ref": True}  # marks reference arguments in tool input models
 
 BOROUGH_ALIASES = {
     "manhattan": "MANHATTAN",
@@ -718,21 +718,21 @@ def render_filter_sql(ctx: ToolContext, a: FilterDatasetArgs) -> RenderedSQL:
     must = set()
     sp = ds.spatial
     if sp:
-        for c in (sp.geometry_column, sp.lat_column, sp.lon_column):
-            if c and c.lower() in names:
-                must.add(names[c.lower()])
-    for c in (ds.id_column, ds.category_column, ds.temporal.column if ds.temporal else None, ds.name_column):
-        if c and c.lower() in names:
-            must.add(names[c.lower()])
+        for gc in (sp.geometry_column, sp.lat_column, sp.lon_column):
+            if gc and gc.lower() in names:
+                must.add(names[gc.lower()])
+    for kc in (ds.id_column, ds.category_column, ds.temporal.column if ds.temporal else None, ds.name_column):
+        if kc and kc.lower() in names:
+            must.add(names[kc.lower()])
     if a.columns:
-        chosen = [col(c).name for c in a.columns]
+        chosen = [col(name).name for name in a.columns]
         selected = list(dict.fromkeys(chosen + sorted(must)))
     else:
-        selected = [c.name for c in cols if c.name.lower() not in sensitive]
+        selected = [ci.name for ci in cols if ci.name.lower() not in sensitive]
 
-    projections: list[exp.Expression] = []
+    projections: list[Any] = []
     for name in selected:
-        c = exp.column(name, quoted=True)
+        c: Any = exp.column(name, quoted=True)
         if (
             sp
             and sp.geometry_column
@@ -744,7 +744,7 @@ def render_filter_sql(ctx: ToolContext, a: FilterDatasetArgs) -> RenderedSQL:
         else:
             projections.append(c)
 
-    conds: list[exp.Expression] = []
+    conds: list[Any] = []
     if a.categories:
         if not ds.category_column:
             notes.append(f"{ds.id} has no category column; 'categories' ignored.")
@@ -752,7 +752,8 @@ def render_filter_sql(ctx: ToolContext, a: FilterDatasetArgs) -> RenderedSQL:
             exact, like, cnotes = resolve_categories(ds, a.categories)
             notes += cnotes
             cc = col(ds.category_column)
-            ors: list[exp.Expression] = []
+            ors: list[Any] = []
+            cond: Any
             if exact:
                 ors.append(exp.In(this=cc, expressions=[param(v) for v in exact]))
             for t in like:
@@ -796,26 +797,26 @@ def render_filter_sql(ctx: ToolContext, a: FilterDatasetArgs) -> RenderedSQL:
                     )
                 )
     for f in a.filters:
-        c = col(f.column)
+        fc: Any = col(f.column)
         if f.op == "is_null":
-            conds.append(exp.Is(this=c, expression=exp.Null()))
+            conds.append(exp.Is(this=fc, expression=exp.Null()))
         elif f.op == "not_null":
-            conds.append(exp.Not(this=exp.Is(this=c, expression=exp.Null())))
+            conds.append(exp.Not(this=exp.Is(this=fc, expression=exp.Null())))
         elif f.op in ("in", "not_in"):
             vals = f.value if isinstance(f.value, list) else [f.value]
-            e = exp.In(this=c, expressions=[param(v) for v in vals])
+            e = exp.In(this=fc, expressions=[param(v) for v in vals])
             conds.append(exp.Not(this=e) if f.op == "not_in" else e)
         elif f.op == "contains":
             conds.append(
                 exp.Like(
-                    this=exp.Lower(this=exp.Cast(this=c, to=exp.DataType.build("VARCHAR"))),
+                    this=exp.Lower(this=exp.Cast(this=fc, to=exp.DataType.build("VARCHAR"))),
                     expression=param(f"%{str(f.value).lower()}%"),
                 )
             )
         elif f.op == "starts_with":
             conds.append(
                 exp.Like(
-                    this=exp.Lower(this=exp.Cast(this=c, to=exp.DataType.build("VARCHAR"))),
+                    this=exp.Lower(this=exp.Cast(this=fc, to=exp.DataType.build("VARCHAR"))),
                     expression=param(f"{str(f.value).lower()}%"),
                 )
             )
@@ -823,10 +824,10 @@ def render_filter_sql(ctx: ToolContext, a: FilterDatasetArgs) -> RenderedSQL:
             vals = f.value if isinstance(f.value, list) else []
             if len(vals) != 2:
                 raise SpatialError("'between' needs a [low, high] value")
-            conds.append(exp.Between(this=c, low=param(vals[0]), high=param(vals[1])))
+            conds.append(exp.Between(this=fc, low=param(vals[0]), high=param(vals[1])))
         else:
             cls = {"=": exp.EQ, "!=": exp.NEQ, ">": exp.GT, ">=": exp.GTE, "<": exp.LT, "<=": exp.LTE}[f.op]
-            conds.append(cls(this=c, expression=param(f.value)))
+            conds.append(cls(this=fc, expression=param(f.value)))
 
     query = exp.select(*projections).from_(exp.to_table(ds.sql_table, dialect=dialect))
     for cnd in conds:
@@ -1072,12 +1073,10 @@ def build_default_registry() -> ToolRegistry:
             lg, rg, a.predicate, ctx.settings.projected_crs, a.distance, a.units, a.how, a.summarize
         )
         dist = f" within {a.distance:g} {a.units}" if a.predicate == "dwithin" else f" ({a.predicate})"
-        rel = {
-            "dwithin": f"within {a.distance:g} {a.units} of",
-            "within": "within",
-            "intersects": "intersecting",
-            "contains": "containing",
-        }[a.predicate]
+        if a.predicate == "dwithin":
+            rel = f"within {a.distance:g} {a.units} of"
+        else:
+            rel = {"within": "within", "intersects": "intersecting", "contains": "containing"}[a.predicate]
         title = f"{la.title} {rel} {ra.title}"
         art = ctx.save(
             title,
@@ -1368,7 +1367,7 @@ def build_default_registry() -> ToolRegistry:
                 summary=f"Gi* hot spot analysis on {a.cell_size:g} {a.units} cells.",
                 highlights=hl,
                 headline=f"{res.stats['hot_cells_95']:,} grid cells ({a.cell_size:g} {a.units}) are "
-                f"statistically significant hot spots of {ia.title.lower()} (95%+)",
+                f"statistically significant hot spots of {ia.title} (95%+)",
                 artifact_id=art.id,
                 rows=len(out),
                 notes=res.notes,
@@ -1409,7 +1408,7 @@ def build_default_registry() -> ToolRegistry:
             status="ok" if len(out) else "empty",
             summary=f"Found {len(out)} clusters of ≥{a.min_points} reports within {a.radius:g} {a.units}.",
             highlights=hl,
-            headline=f"{len(out)} locations with {a.min_points}+ {ia.title.lower()} within "
+            headline=f"{len(out)} locations with {a.min_points}+ {ia.title} within "
             f"{a.radius:g} {a.units} of each other",
             artifact_id=art.id,
             rows=len(out),
@@ -1493,8 +1492,8 @@ def build_default_registry() -> ToolRegistry:
         if "is_joint_interest_area" in gg:
             gg = gg[~gg["is_joint_interest_area"].astype(bool)]
         gg = restrict_areas_to_input(gg, ig)
-        pa = tuple(a.period_a) if a.period_a and len(a.period_a) == 2 else None
-        pb = tuple(a.period_b) if a.period_b and len(a.period_b) == 2 else None
+        pa = (a.period_a[0], a.period_a[1]) if a.period_a and len(a.period_a) == 2 else None
+        pb = (a.period_b[0], a.period_b[1]) if a.period_b and len(a.period_b) == 2 else None
         res = A.compare_periods(ig, gg, dcol, gds.name_column, pa, pb, a.min_baseline, a.top_n)
         out = res.data
         label = gds.name_column or "rank"

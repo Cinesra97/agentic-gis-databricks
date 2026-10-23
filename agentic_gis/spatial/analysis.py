@@ -246,7 +246,7 @@ def gi_star_hotspots(
 
     def window_sum(a: np.ndarray) -> np.ndarray:
         p = np.pad(a, 1)
-        return sum(
+        return sum(  # type: ignore[return-value]
             p[1 + dx : p.shape[0] - 1 + dx, 1 + dy : p.shape[1] - 1 + dy]
             for dx in (-1, 0, 1)
             for dy in (-1, 0, 1)

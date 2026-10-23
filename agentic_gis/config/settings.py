@@ -120,6 +120,9 @@ class Settings(BaseSettings):
 
     # ---- Map -----------------------------------------------------------------------------
     map_renderer: Literal["folium", "pydeck"] = "folium"
+    map_assets: Literal["local", "cdn"] = Field(
+        "local", description="local = vendored Leaflet JS/CSS (works offline); cdn = public CDNs"
+    )
     default_basemap: str = "CARTO Dark Matter"
     custom_basemap_url: str | None = None
     custom_basemap_attribution: str | None = None
