@@ -1,0 +1,66 @@
+{
+  "generated_utc": "2026-10-23T16:38:08Z",
+  "seed": 20241023,
+  "generator": "scripts/build_sample_data.py",
+  "files": {
+    "sample_data/reference/nyc_boroughs.parquet": {
+      "rows": 5,
+      "sha256": "2c163ce32081a12e54a17a3ddc9eec81b3e03fd85748b2bc085eaffa25462cf4",
+      "bytes": 91512,
+      "synthetic": false
+    },
+    "sample_data/reference/nyc_community_districts.parquet": {
+      "rows": 71,
+      "sha256": "ee349345a096ea62667c04bc3d8c9caea04c55f3744b0ac903c2c567c1b05310",
+      "bytes": 121254,
+      "synthetic": false
+    },
+    "sample_data/reference/nyc_modzcta.parquet": {
+      "rows": 177,
+      "sha256": "befb8d19951267b4bdeb0f997686aa6391a43c213b949a3c5ff138b14824fd88",
+      "bytes": 93319,
+      "synthetic": false
+    },
+    "sample_data/synthetic_street_corridors.parquet": {
+      "rows": 769,
+      "sha256": "5dba5a1e5e6f80d042897102fe70de149b35c41c61174b58c0c9ef62baf09fc2",
+      "bytes": 26146,
+      "synthetic": true
+    },
+    "sample_data/synthetic_industrial_lots.parquet": {
+      "rows": 625,
+      "sha256": "09459bd6f7cde73607b2e2bc5244e2eee2aa24cb0a8cc8cff861549afaac5022",
+      "bytes": 55578,
+      "synthetic": true
+    },
+    "sample_data/synthetic_catch_basins.parquet": {
+      "rows": 5003,
+      "sha256": "a4a2286b5bfac94fa4c7fc3cb3793f7e8abd04ac68e929e9672aa09250fd27fd",
+      "bytes": 195664,
+      "synthetic": true
+    },
+    "sample_data/synthetic_311_sanitation.parquet": {
+      "rows": 8917,
+      "sha256": "e93cc771b38682e8c5230819a1da2f9c921daf4ad6e1fb06cdaa73ff2491ed7f",
+      "bytes": 531652,
+      "synthetic": true
+    }
+  },
+  "sources": {
+    "boroughs": {
+      "url": "https://raw.githubusercontent.com/dwillis/nyc-maps/master/boroughs.geojson",
+      "publisher": "NYC Department of City Planning (Borough Boundaries, clipped to shoreline)",
+      "mirror": "github.com/dwillis/nyc-maps (ogr2ogr conversion of DCP Bytes of the Big Apple)"
+    },
+    "community_districts": {
+      "url": "https://raw.githubusercontent.com/dwillis/nyc-maps/master/community_districts.geojson",
+      "publisher": "NYC Department of City Planning (Community Districts)",
+      "mirror": "github.com/dwillis/nyc-maps (ogr2ogr conversion of DCP Bytes of the Big Apple)"
+    },
+    "modzcta": {
+      "url": "https://raw.githubusercontent.com/nychealth/coronavirus-data/master/Geography-resources/MODZCTA_2010_WGS1984.geo.json",
+      "publisher": "NYC Department of Health and Mental Hygiene (Modified ZIP Code Tabulation Areas)",
+      "mirror": "github.com/nychealth/coronavirus-data"
+    }
+  }
+}

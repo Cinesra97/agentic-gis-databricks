@@ -1,0 +1,461 @@
+# Dataset registry (allowlist) for agentic-gis-databricks.
+#
+# Only datasets listed here, enabled, and visible in the active mode can be discovered,
+# described, or queried by the agent. The SQL guard rejects any table not in this list.
+#
+#   modes:        demo       -> bundled offline sample data (synthetic events + real boundaries)
+#                 local      -> public NYC Open Data ingested to data/ingested/ (agentic-gis ingest ...)
+#                 databricks -> Unity Catalog tables on an authorized SQL warehouse
+#   sensitivity:  public | internal | confidential | restricted (controls what may reach an LLM prompt)
+#   synthetic:    true for generated data; the UI and answers label results accordingly.
+#
+# Workspace-specific or sensitive entries belong in config/datasets.local.yaml (git-ignored),
+# which is merged over this file. ${VAR:-default} placeholders are filled from the environment.
+version: 1
+
+# Geography roles used by aggregate_by_geography / filter_by_area / compare_periods.
+geographies:
+  borough: nyc_boroughs
+  community_district: nyc_community_districts
+  neighborhood:
+    local: [nyc_nta_2020, nyc_community_districts]
+    default: [nyc_community_districts]
+  zip: nyc_modzcta
+
+datasets:
+  # --------------------------------------------------------------------------------------
+  # Reference boundaries (real public data, simplified ~25 m). Available in every mode.
+  # --------------------------------------------------------------------------------------
+  - id: nyc_boroughs
+    name: NYC borough boundaries
+    short_name: boroughs
+    description: Five NYC borough boundaries (clipped to shoreline), simplified for interactive mapping.
+    backend: local
+    modes: [demo, local, databricks]
+    role: boundary
+    geography_role: borough
+    name_column: boro_name
+    sensitivity: public
+    tags: [borough, boundary, administrative]
+    source: {type: file, path: sample_data/reference/nyc_boroughs.parquet, format: geoparquet}
+    spatial: {geometry_column: geometry, geometry_type: polygon, format: wkb, crs: "EPSG:4326"}
+    id_column: boro_code
+    join_keys: {borough: borough}
+    columns:
+      - {name: boro_code, type: integer, description: "Borough code (1=MN, 2=BX, 3=BK, 4=QN, 5=SI)"}
+      - {name: boro_name, type: string, description: Borough name, known_values: [Manhattan, Bronx, Brooklyn, Queens, Staten Island]}
+      - {name: borough, type: string, description: Upper-case borough name matching 311 records}
+      - {name: boro_abbrev, type: string, description: Two-letter borough abbreviation}
+      - {name: geometry, type: geometry, description: Boundary polygon (EPSG:4326)}
+    provenance:
+      publisher: NYC Department of City Planning
+      source_url: https://www.nyc.gov/site/planning/data-maps/open-data.page
+      license: NYC Open Data Terms of Use (public data)
+      notes: Retrieved via the github.com/dwillis/nyc-maps GeoJSON conversion; simplified with an 80 ft coverage-preserving tolerance.
+      citation: "NYC Department of City Planning, Borough Boundaries (clipped to shoreline)."
+
+  - id: nyc_community_districts
+    name: NYC community districts (neighborhood-scale areas)
+    short_name: community districts
+    description: >-
+      59 community districts plus 12 joint interest areas (major parks and airports), each labeled with
+      commonly used neighborhood names. Used as the neighborhood geography when NTA boundaries are not ingested.
+    backend: local
+    modes: [demo, local, databricks]
+    role: boundary
+    geography_role: community_district
+    name_column: label
+    sensitivity: public
+    tags: [community district, community board, neighborhood, boundary]
+    source: {type: file, path: sample_data/reference/nyc_community_districts.parquet, format: geoparquet}
+    spatial: {geometry_column: geometry, geometry_type: polygon, format: wkb, crs: "EPSG:4326"}
+    id_column: boro_cd
+    join_keys: {community_board: community_board, cd_code: cd_code, borough: borough}
+    columns:
+      - {name: boro_cd, type: integer, description: "Borough + district code, e.g. 304 = Brooklyn CD 4"}
+      - {name: cd_code, type: string, description: "Short code, e.g. BK04"}
+      - {name: boro_code, type: integer, description: Borough code}
+      - {name: boro_name, type: string, description: Borough name}
+      - {name: borough, type: string, description: Upper-case borough name}
+      - {name: community_board, type: string, description: "311-style community board, e.g. '04 BROOKLYN'"}
+      - {name: neighborhood, type: string, description: Common neighborhood label for the district}
+      - {name: label, type: string, description: "Display label, e.g. 'BK04 Bushwick'"}
+      - {name: is_joint_interest_area, type: boolean, description: True for parks/airports that are not community boards}
+      - {name: geometry, type: geometry, description: Boundary polygon (EPSG:4326)}
+    provenance:
+      publisher: NYC Department of City Planning
+      source_url: https://www.nyc.gov/site/planning/data-maps/open-data.page
+      license: NYC Open Data Terms of Use (public data)
+      notes: Neighborhood labels follow NYC DOHMH Community Health Profile naming. Simplified with an 80 ft tolerance.
+      citation: "NYC Department of City Planning, Community Districts."
+
+  - id: nyc_modzcta
+    name: NYC ZIP code areas (MODZCTA)
+    short_name: ZIP areas
+    description: Modified ZIP Code Tabulation Areas used by NYC DOHMH; each area may combine several ZIP codes.
+    backend: local
+    modes: [demo, local, databricks]
+    role: boundary
+    geography_role: zip
+    name_column: modzcta
+    sensitivity: public
+    tags: [zip, zip code, postal, modzcta, boundary]
+    source: {type: file, path: sample_data/reference/nyc_modzcta.parquet, format: geoparquet}
+    spatial: {geometry_column: geometry, geometry_type: polygon, format: wkb, crs: "EPSG:4326"}
+    id_column: modzcta
+    join_keys: {incident_zip: modzcta}
+    columns:
+      - {name: modzcta, type: string, description: Modified ZCTA code}
+      - {name: zip_codes, type: string, description: ZIP codes included in the area}
+      - {name: borough, type: string, description: Borough containing the area's representative point}
+      - {name: geometry, type: geometry, description: Boundary polygon (EPSG:4326)}
+    provenance:
+      publisher: NYC Department of Health and Mental Hygiene
+      source_url: https://github.com/nychealth/coronavirus-data/tree/master/Geography-resources
+      license: NYC Open Data Terms of Use (public data)
+      notes: Simplified with an 80 ft coverage-preserving tolerance.
+      citation: "NYC DOHMH, Modified Zip Code Tabulation Areas (MODZCTA)."
+
+  # --------------------------------------------------------------------------------------
+  # Synthetic demonstration data (demo mode). NOT REAL NYC RECORDS.
+  # --------------------------------------------------------------------------------------
+  - id: demo_311_sanitation
+    name: "SYNTHETIC 311-style sanitation complaints (demo)"
+    short_name: 311 sanitation complaints
+    description: >-
+      Synthetic records shaped like NYC 311 DSNY service requests, 2022-2024: illegal dumping, derelict vehicles,
+      street sweeping, missed collection, dirty conditions, litter baskets. Generated with a fixed seed for demos.
+      Not real complaints; analytical results are not findings about NYC.
+    backend: local
+    modes: [demo]
+    synthetic: true
+    role: events
+    sensitivity: public
+    tags: [311, complaints, sanitation, dsny, service requests, dumping, derelict vehicles, sweeping, litter, collection]
+    synonyms:
+      dumping: Illegal Dumping
+      illegal dumping: Illegal Dumping
+      dumped: Illegal Dumping
+      derelict: Derelict Vehicles
+      abandoned car: Derelict Vehicles
+      abandoned vehicle: Derelict Vehicles
+      abandoned vehicles: Derelict Vehicles
+      sweeping: Street Sweeping Complaint
+      street sweeping: Street Sweeping Complaint
+      missed sweeping: Street Sweeping Complaint
+      missed collection: Missed Collection
+      missed pickup: Missed Collection
+      garbage pickup: Missed Collection
+      litter basket: Litter Basket Complaint
+      trash can: Litter Basket Complaint
+      dirty: Dirty Condition
+      dirty condition: Dirty Condition
+    source: {type: file, path: sample_data/synthetic_311_sanitation.parquet, format: geoparquet}
+    spatial: {geometry_column: geometry, geometry_type: point, format: wkb, crs: "EPSG:4326", lat_column: latitude, lon_column: longitude}
+    temporal: {column: created_date, granularity: timestamp}
+    id_column: unique_key
+    category_column: complaint_type
+    join_keys: {borough: borough, community_board: community_board, cd_code: cd_code, incident_zip: incident_zip}
+    columns:
+      - {name: unique_key, type: integer, description: Synthetic request id (900000001+)}
+      - {name: created_date, type: timestamp, description: When the complaint was created}
+      - {name: closed_date, type: timestamp, description: When the complaint was closed (null if open)}
+      - {name: agency, type: string, description: Responding agency, known_values: [DSNY]}
+      - name: complaint_type
+        type: string
+        description: Complaint category
+        known_values: [Illegal Dumping, Derelict Vehicles, Street Sweeping Complaint, Missed Collection, Dirty Condition, Litter Basket Complaint, Sanitation Condition]
+      - {name: descriptor, type: string, description: Complaint sub-type}
+      - {name: location_type, type: string, description: "Location type (Street, Sidewalk, Vacant Lot ...)"}
+      - {name: incident_zip, type: string, description: MODZCTA code of the location}
+      - {name: incident_address, type: string, description: Synthetic address (house number + corridor or SYNTHETIC SITE)}
+      - {name: street_name, type: string, description: Nearest synthetic corridor name within 120 ft (else null)}
+      - {name: borough, type: string, description: Upper-case borough name, known_values: [MANHATTAN, BRONX, BROOKLYN, QUEENS, STATEN ISLAND]}
+      - {name: community_board, type: string, description: "Community board, e.g. '04 BROOKLYN'"}
+      - {name: cd_code, type: string, description: "Community district code, e.g. BK04"}
+      - {name: status, type: string, description: Open or Closed, known_values: [Open, Closed]}
+      - {name: resolution_description, type: string, description: Synthetic resolution text}
+      - {name: location_id, type: string, description: Synthetic repeat-site identifier (null for most records)}
+      - {name: latitude, type: double, description: Latitude (WGS84)}
+      - {name: longitude, type: double, description: Longitude (WGS84)}
+      - {name: is_synthetic, type: boolean, description: Always true}
+      - {name: geometry, type: geometry, description: Point (EPSG:4326)}
+    provenance:
+      publisher: agentic-gis-databricks sample data generator (synthetic)
+      source_url: scripts/build_sample_data.py
+      license: Apache-2.0 (generated data)
+      notes: Fixed seed 20241023. Spatial and temporal patterns were planted to exercise analysis tools.
+      citation: "Synthetic demonstration data generated by scripts/build_sample_data.py; not NYC records."
+
+  - id: demo_catch_basins
+    name: "SYNTHETIC catch basins (demo)"
+    short_name: catch basins
+    description: Synthetic catch basin points placed along approximate street corridors and scattered citywide, with condition and inspection dates.
+    backend: local
+    modes: [demo]
+    synthetic: true
+    role: infrastructure
+    sensitivity: public
+    tags: [catch basin, catch basins, storm drain, sewer, infrastructure, dep, drainage]
+    synonyms: {storm drain: catch basin, drain: catch basin}
+    source: {type: file, path: sample_data/synthetic_catch_basins.parquet, format: geoparquet}
+    spatial: {geometry_column: geometry, geometry_type: point, format: wkb, crs: "EPSG:4326", lat_column: latitude, lon_column: longitude}
+    temporal: {column: last_inspected, granularity: day}
+    id_column: basin_id
+    category_column: condition
+    columns:
+      - {name: basin_id, type: string, description: Synthetic basin id}
+      - {name: street_name, type: string, description: Corridor the basin was placed along (null if scattered)}
+      - {name: condition, type: string, description: Inspection condition, known_values: [Clean, Partially clogged, Clogged, Needs repair]}
+      - {name: last_inspected, type: timestamp, description: Last inspection date}
+      - {name: maintaining_agency, type: string, description: Maintaining agency label}
+      - {name: borough, type: string, description: Upper-case borough name}
+      - {name: cd_code, type: string, description: Community district code}
+      - {name: latitude, type: double, description: Latitude}
+      - {name: longitude, type: double, description: Longitude}
+      - {name: is_synthetic, type: boolean, description: Always true}
+      - {name: geometry, type: geometry, description: Point (EPSG:4326)}
+    provenance:
+      publisher: agentic-gis-databricks sample data generator (synthetic)
+      source_url: scripts/build_sample_data.py
+      license: Apache-2.0 (generated data)
+      citation: "Synthetic demonstration data; not NYC DEP records."
+
+  - id: demo_street_corridors
+    name: "SYNTHETIC approximate street corridors (demo)"
+    short_name: street segments
+    description: >-
+      Approximate centerlines of 23 major NYC corridors (e.g. Atlantic Avenue, Grand Concourse, Queens Boulevard),
+      hand-digitized and split into ~900 ft segments. Approximate geometry, not authoritative street centerlines.
+    backend: local
+    modes: [demo]
+    synthetic: true
+    role: streets
+    name_column: street_name
+    sensitivity: public
+    tags: [street, streets, avenue, boulevard, road, centerline, corridor, segment]
+    source: {type: file, path: sample_data/synthetic_street_corridors.parquet, format: geoparquet}
+    spatial: {geometry_column: geometry, geometry_type: line, format: wkb, crs: "EPSG:4326"}
+    id_column: segment_id
+    columns:
+      - {name: segment_id, type: string, description: Synthetic segment id}
+      - name: street_name
+        type: string
+        description: Upper-case street name
+        known_values: [BROADWAY, CANAL STREET, 125 STREET, ATLANTIC AVENUE, FLATBUSH AVENUE, FULTON STREET, EASTERN PARKWAY, MYRTLE AVENUE, BUSHWICK AVENUE, FLUSHING AVENUE, METROPOLITAN AVENUE, LINDEN BOULEVARD, 3 AVENUE, GRAND CONCOURSE, FORDHAM ROAD, WEBSTER AVENUE, SOUTHERN BOULEVARD, HUNTS POINT AVENUE, QUEENS BOULEVARD, NORTHERN BOULEVARD, JAMAICA AVENUE, VICTORY BOULEVARD, HYLAN BOULEVARD]
+      - {name: street_class, type: string, description: Street class label}
+      - {name: length_ft, type: double, description: Segment length in feet}
+      - {name: borough, type: string, description: Upper-case borough name}
+      - {name: is_synthetic, type: boolean, description: Always true}
+      - {name: geometry, type: geometry, description: LineString (EPSG:4326)}
+    provenance:
+      publisher: agentic-gis-databricks sample data generator (synthetic)
+      source_url: scripts/build_sample_data.py
+      license: Apache-2.0 (generated data)
+      notes: Geometry may be off by 50-200 m. Use NYC LION / CSCL centerlines for real analysis.
+      citation: "Synthetic approximate corridors; not NYC DCP LION or DOT CSCL data."
+
+  - id: demo_industrial_lots
+    name: "SYNTHETIC industrial lots (demo)"
+    short_name: industrial lots
+    description: Synthetic tax-lot-like polygons with land use 06 (Industrial & Manufacturing) clustered in known industrial areas.
+    backend: local
+    modes: [demo]
+    synthetic: true
+    role: parcels
+    sensitivity: public
+    tags: [industrial, manufacturing, property, properties, lot, lots, parcel, pluto, land use, zoning]
+    synonyms: {industrial property: industrial, industrial properties: industrial, manufacturing: industrial}
+    source: {type: file, path: sample_data/synthetic_industrial_lots.parquet, format: geoparquet}
+    spatial: {geometry_column: geometry, geometry_type: polygon, format: wkb, crs: "EPSG:4326"}
+    id_column: lot_id
+    category_column: industrial_area
+    columns:
+      - {name: lot_id, type: string, description: Synthetic lot id}
+      - {name: industrial_area, type: string, description: Named industrial area the lot was generated in}
+      - {name: landuse, type: string, description: "PLUTO-style land use code ('06')"}
+      - {name: landuse_desc, type: string, description: Land use description}
+      - {name: zoning, type: string, description: Manufacturing zoning district}
+      - {name: bldg_class, type: string, description: Building class}
+      - {name: lot_area_sqft, type: integer, description: Lot area (sq ft)}
+      - {name: year_built, type: integer, description: Year built}
+      - {name: borough, type: string, description: Upper-case borough name}
+      - {name: is_synthetic, type: boolean, description: Always true}
+      - {name: geometry, type: geometry, description: Polygon (EPSG:4326)}
+    provenance:
+      publisher: agentic-gis-databricks sample data generator (synthetic)
+      source_url: scripts/build_sample_data.py
+      license: Apache-2.0 (generated data)
+      citation: "Synthetic demonstration data; not NYC PLUTO records."
+
+  # --------------------------------------------------------------------------------------
+  # Public NYC Open Data (local mode). Populate with: agentic-gis ingest <id>
+  # Socrata dataset ids marked verified_id: false must be confirmed on data.cityofnewyork.us.
+  # --------------------------------------------------------------------------------------
+  - id: nyc_311_sanitation
+    name: NYC 311 service requests - DSNY (public, ingested subset)
+    short_name: 311 sanitation complaints
+    description: Real NYC 311 service requests routed to the Department of Sanitation, ingested from NYC Open Data for a bounded date range.
+    backend: local
+    modes: [local]
+    role: events
+    sensitivity: public
+    tags: [311, complaints, sanitation, dsny, service requests, dumping, derelict vehicles, sweeping, litter, collection]
+    synonyms:
+      dumping: Illegal Dumping
+      illegal dumping: Illegal Dumping
+      derelict: Derelict Vehicles
+      abandoned car: Derelict Vehicles
+      abandoned vehicle: Derelict Vehicles
+      sweeping: Street Sweeping Complaint
+      missed sweeping: Street Sweeping Complaint
+      missed collection: Missed Collection
+      litter basket: Litter Basket Complaint
+      dirty: Dirty Condition
+    source:
+      type: socrata
+      path: data/ingested/nyc_311_sanitation.parquet
+      format: geoparquet
+      socrata:
+        dataset_id: erm2-nwe9
+        verified_id: true
+        select: unique_key, created_date, closed_date, agency, complaint_type, descriptor, location_type, incident_zip, incident_address, street_name, borough, community_board, status, resolution_description, latitude, longitude
+        where: "agency = 'DSNY' AND latitude IS NOT NULL AND created_date >= '2023-01-01T00:00:00'"
+        order: created_date DESC
+        limit: 150000
+    spatial: {geometry_column: geometry, geometry_type: point, format: wkb, crs: "EPSG:4326", lat_column: latitude, lon_column: longitude}
+    temporal: {column: created_date, granularity: timestamp}
+    id_column: unique_key
+    category_column: complaint_type
+    join_keys: {borough: borough, community_board: community_board, incident_zip: incident_zip}
+    columns:
+      - {name: unique_key, type: integer, description: 311 request id}
+      - {name: created_date, type: timestamp, description: When the request was created}
+      - {name: closed_date, type: timestamp, description: When the request was closed}
+      - {name: agency, type: string, description: Responding agency}
+      - {name: complaint_type, type: string, description: Complaint category, known_values: [Illegal Dumping, Derelict Vehicles, Street Sweeping Complaint, Missed Collection, Dirty Condition, Litter Basket Complaint, Sanitation Condition]}
+      - {name: descriptor, type: string, description: Complaint sub-type}
+      - {name: location_type, type: string, description: Location type}
+      - {name: incident_zip, type: string, description: ZIP code}
+      - {name: incident_address, type: string, description: Address}
+      - {name: street_name, type: string, description: Street name}
+      - {name: borough, type: string, description: Upper-case borough name}
+      - {name: community_board, type: string, description: Community board}
+      - {name: status, type: string, description: Request status}
+      - {name: resolution_description, type: string, description: Resolution text (free text from the source)}
+      - {name: latitude, type: double, description: Latitude}
+      - {name: longitude, type: double, description: Longitude}
+      - {name: geometry, type: geometry, description: Point (EPSG:4326)}
+    provenance:
+      publisher: NYC Open Data (311 Service Requests from 2010 to Present)
+      source_url: https://data.cityofnewyork.us/Social-Services/311-Service-Requests-from-2010-to-Present/erm2-nwe9
+      license: NYC Open Data Terms of Use
+      notes: 311 records are public reports, not verified violations. Locations may be approximate.
+      citation: "NYC 311 Service Requests (erm2-nwe9), NYC Open Data."
+
+  - id: nyc_nta_2020
+    name: NYC 2020 Neighborhood Tabulation Areas (public, ingested)
+    short_name: NTAs
+    description: 2020 Neighborhood Tabulation Areas from NYC Department of City Planning.
+    backend: local
+    modes: [local, databricks]
+    role: boundary
+    geography_role: neighborhood
+    name_column: ntaname
+    sensitivity: public
+    tags: [neighborhood, nta, boundary]
+    source:
+      type: socrata
+      path: data/ingested/nyc_nta_2020.parquet
+      format: geoparquet
+      socrata: {dataset_id: 9nt8-h7nd, geojson: true, verified_id: false, limit: 1000}
+    spatial: {geometry_column: geometry, geometry_type: polygon, format: wkb, crs: "EPSG:4326"}
+    columns:
+      - {name: nta2020, type: string, description: NTA code}
+      - {name: ntaname, type: string, description: NTA name}
+      - {name: boroname, type: string, description: Borough name}
+      - {name: geometry, type: geometry, description: Boundary polygon}
+    provenance:
+      publisher: NYC Department of City Planning via NYC Open Data
+      source_url: https://data.cityofnewyork.us/d/9nt8-h7nd
+      license: NYC Open Data Terms of Use
+      citation: "NYC DCP, 2020 Neighborhood Tabulation Areas."
+
+  - id: nyc_pluto_industrial
+    name: NYC PLUTO industrial & manufacturing lots (public, ingested)
+    short_name: industrial lots
+    description: Tax lots with land use 06 (Industrial & Manufacturing) from MapPLUTO/PLUTO, as lot centroid points.
+    backend: local
+    modes: [local]
+    role: parcels
+    sensitivity: public
+    tags: [industrial, manufacturing, property, properties, lot, lots, parcel, pluto, land use]
+    synonyms: {industrial property: industrial, industrial properties: industrial}
+    source:
+      type: socrata
+      path: data/ingested/nyc_pluto_industrial.parquet
+      format: geoparquet
+      socrata:
+        dataset_id: 64uk-42ks
+        verified_id: false
+        select: bbl, borough, landuse, zonedist1, bldgclass, lotarea, yearbuilt, latitude, longitude
+        where: "landuse = '06' AND latitude IS NOT NULL"
+        limit: 60000
+    spatial: {geometry_column: geometry, geometry_type: point, format: wkb, crs: "EPSG:4326", lat_column: latitude, lon_column: longitude}
+    id_column: bbl
+    columns:
+      - {name: bbl, type: string, description: Borough-block-lot id}
+      - {name: borough, type: string, description: Two-letter borough code}
+      - {name: landuse, type: string, description: Land use code}
+      - {name: zonedist1, type: string, description: Primary zoning district}
+      - {name: bldgclass, type: string, description: Building class}
+      - {name: lotarea, type: double, description: Lot area (sq ft)}
+      - {name: yearbuilt, type: integer, description: Year built}
+      - {name: latitude, type: double, description: Latitude}
+      - {name: longitude, type: double, description: Longitude}
+      - {name: geometry, type: geometry, description: Lot centroid point}
+    provenance:
+      publisher: NYC Department of City Planning (PLUTO) via NYC Open Data
+      source_url: https://data.cityofnewyork.us/d/64uk-42ks
+      license: NYC Open Data Terms of Use
+      citation: "NYC DCP, Primary Land Use Tax Lot Output (PLUTO)."
+
+  # --------------------------------------------------------------------------------------
+  # Databricks / Unity Catalog examples. DISABLED until an administrator confirms access,
+  # sets the spatial columns, and enables them (preferably in config/datasets.local.yaml).
+  # These identifiers are examples only; they are never queried automatically.
+  # --------------------------------------------------------------------------------------
+  - id: dsny_catch_basins_exploded
+    name: DSNY catch basins (Unity Catalog example)
+    short_name: catch basins
+    description: Example registration for an agency catch basin table. Verify columns with get_schema before enabling.
+    backend: databricks
+    modes: [databricks]
+    enabled: false
+    role: infrastructure
+    sensitivity: internal
+    schema_discovery: true
+    tags: [catch basin, catch basins, infrastructure, dsny]
+    source: {type: databricks_table, table: "${DATABRICKS_CATALOG:-dsny_sandbox}.${DATABRICKS_SCHEMA:-egpmo_sandbox}.catch_basins_exploded_final"}
+    # spatial: {geometry_column: geom_wkt, geometry_type: point, format: wkt, crs: "EPSG:2263"}   # set after inspection
+    provenance:
+      publisher: NYC Department of Sanitation (internal)
+      license: Internal use only
+      citation: "DSNY catch basin table (Unity Catalog)."
+
+  - id: dsny_catch_basin_records
+    name: DSNY catch basin records (Unity Catalog example)
+    short_name: catch basin records
+    description: Example registration for catch basin service records. Verify columns with get_schema before enabling.
+    backend: databricks
+    modes: [databricks]
+    enabled: false
+    role: events
+    sensitivity: internal
+    schema_discovery: true
+    tags: [catch basin, records, inspections, dsny]
+    source: {type: databricks_table, table: "${DATABRICKS_CATALOG:-dsny_sandbox}.${DATABRICKS_SCHEMA:-egpmo_sandbox}.catch_basin_records_final"}
+    provenance:
+      publisher: NYC Department of Sanitation (internal)
+      license: Internal use only
+      citation: "DSNY catch basin records table (Unity Catalog)."

@@ -90,6 +90,9 @@ extend-exclude = ["notebooks"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "SIM"]
 ignore = [
+    "E501",  # line length is handled by `ruff format`
+    "SIM102",
+    "SIM108",
     "S101",  # assert is fine in tests
     "S608",  # SQL is built only from validated identifiers and passed through the AST guard
     "B008",
