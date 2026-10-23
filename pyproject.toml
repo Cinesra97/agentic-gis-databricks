@@ -1,0 +1,109 @@
+[project]
+name = "agentic-gis-databricks"
+version = "0.1.0"
+description = "Open-source agentic GIS: natural-language spatial analysis over Databricks, DuckDB and NYC open data, with a local LLM (Ollama), LangGraph orchestration and interactive maps."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11,<3.14"
+authors = [{ name = "agentic-gis-databricks contributors" }]
+keywords = ["gis", "geospatial", "databricks", "duckdb", "langgraph", "ollama", "streamlit", "nyc"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+    # UI
+    "streamlit>=1.40",
+    "streamlit-folium>=0.22",
+    "folium>=0.17",
+    "branca>=0.7",
+    "pydeck>=0.9",
+    # Agent orchestration (no LangChain chat-model dependency; LLM calls use plain HTTP)
+    "langgraph>=1.0,<2",
+    "pydantic>=2.7,<3",
+    "pydantic-settings>=2.4",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    # Analytics + spatial
+    "duckdb>=1.5,<1.6",
+    "geopandas>=1.0",
+    "shapely>=2.0",
+    "pyproj>=3.6",
+    "pyarrow>=16",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    # SQL safety (AST validation)
+    "sqlglot>=25",
+    # Databricks SQL warehouse access (official connector)
+    "databricks-sql-connector>=3.4",
+]
+
+[project.optional-dependencies]
+# OAuth machine-to-machine / Databricks Apps service-principal auth
+databricks-auth = ["databricks-sdk>=0.30"]
+# Phase 2 imagery: raster IO (rasterio wheels bundle GDAL)
+imagery = ["rasterio>=1.4"]
+# Phase 2 vector search backend
+vector = ["qdrant-client>=1.9"]
+# Offline DuckDB spatial extension packaged as a wheel (third-party repackaging of the
+# official extension binary; see docs/SECURITY.md before using in production).
+duckdb-spatial-wheel = ["duckdb-extension-spatial==1.5.5"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-PyYAML>=6",
+    "nbformat>=5.10",
+]
+
+[project.scripts]
+agentic-gis = "agentic_gis.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentic_gis"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "ollama: requires a running Ollama server (skipped unless OLLAMA_LIVE_TESTS=1)",
+    "databricks: requires Databricks credentials (skipped unless DATABRICKS_LIVE_TESTS=1)",
+    "slow: slower end-to-end tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:pyogrio.*",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM"]
+ignore = [
+    "S101",  # assert is fine in tests
+    "S608",  # SQL is built only from validated identifiers and passed through the AST guard
+    "B008",
+    "UP040",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "B"]
+"scripts/*" = ["S311"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+check_untyped_defs = false
+warn_unused_ignores = false
+no_implicit_optional = true
+exclude = ["notebooks/", "build/"]

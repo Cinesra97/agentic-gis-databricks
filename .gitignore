@@ -1,0 +1,48 @@
+# --- Secrets & local configuration (never commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.databrickscfg
+secrets/
+config/datasets.local.yaml
+.streamlit/secrets.toml
+
+# --- Runtime data, caches, logs ---
+data/cache/
+data/ingested/
+data/imagery/
+logs/
+*.log
+audit*.jsonl
+*.duckdb
+*.duckdb.wal
+exports/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
