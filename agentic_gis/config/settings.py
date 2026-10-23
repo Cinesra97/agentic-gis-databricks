@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import AliasChoices, Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -77,6 +77,11 @@ class Settings(BaseSettings):
         None, validation_alias=_alias("DATABRICKS_SERVER_HOSTNAME", "DATABRICKS_HOST")
     )
     databricks_http_path: str | None = Field(None, validation_alias=_alias("DATABRICKS_HTTP_PATH"))
+    databricks_warehouse_id: str | None = Field(
+        None,
+        validation_alias=_alias("DATABRICKS_WAREHOUSE_ID"),
+        description="Alternative to DATABRICKS_HTTP_PATH (Databricks Apps exposes warehouse resources by id)",
+    )
     databricks_token: SecretStr | None = Field(None, validation_alias=_alias("DATABRICKS_TOKEN"))
     databricks_catalog: str | None = Field(None, validation_alias=_alias("DATABRICKS_CATALOG"))
     databricks_schema: str | None = Field(None, validation_alias=_alias("DATABRICKS_SCHEMA"))
@@ -151,6 +156,14 @@ class Settings(BaseSettings):
         if "://" in v:
             v = urlparse(v).netloc
         return v.rstrip("/") or None
+
+    @model_validator(mode="after")
+    def _derive_http_path(self) -> Settings:
+        if not self.databricks_http_path and self.databricks_warehouse_id:
+            wid = self.databricks_warehouse_id.strip()
+            if wid.replace("-", "").isalnum():
+                self.databricks_http_path = f"/sql/1.0/warehouses/{wid}"
+        return self
 
     # ---- Derived helpers -----------------------------------------------------------------
     @property

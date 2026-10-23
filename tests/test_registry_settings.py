@@ -84,3 +84,11 @@ def test_register_writes_overlay(tmp_path, registry):
     assert "uc_test" in out.read_text()
     reloaded = DatasetRegistry.load(ROOT / "config/datasets.yaml", out, env={})
     assert reloaded.get_any("uc_test").source.table == "a.b.c"
+
+
+def test_warehouse_id_derives_http_path(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_HOST", "https://adb-3.azuredatabricks.net")
+    monkeypatch.setenv("DATABRICKS_WAREHOUSE_ID", "abc123def456")
+    s = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert s.databricks_http_path == "/sql/1.0/warehouses/abc123def456"
+    assert s.databricks_server_hostname == "adb-3.azuredatabricks.net"

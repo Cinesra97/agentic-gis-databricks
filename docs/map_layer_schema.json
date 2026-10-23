@@ -1,0 +1,245 @@
+{
+  "$defs": {
+    "LayerStyle": {
+      "properties": {
+        "color_role": {
+          "default": "single",
+          "enum": [
+            "single",
+            "context",
+            "categorical",
+            "sequential",
+            "diverging",
+            "hotspot"
+          ],
+          "title": "Color Role",
+          "type": "string"
+        },
+        "color_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Color By"
+        },
+        "breaks": {
+          "description": "Upper class bounds for numeric classes",
+          "items": {
+            "type": "number"
+          },
+          "title": "Breaks",
+          "type": "array"
+        },
+        "categories": {
+          "description": "Ordered category values (max 3 + Other)",
+          "items": {
+            "type": "string"
+          },
+          "title": "Categories",
+          "type": "array"
+        },
+        "radius": {
+          "default": 5.0,
+          "title": "Radius",
+          "type": "number"
+        },
+        "size_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Numeric column scaling marker radius (points / centroids)",
+          "title": "Size By"
+        },
+        "size_range": {
+          "items": {
+            "type": "number"
+          },
+          "title": "Size Range",
+          "type": "array"
+        },
+        "weight": {
+          "default": 2.0,
+          "title": "Weight",
+          "type": "number"
+        },
+        "opacity": {
+          "default": 0.9,
+          "title": "Opacity",
+          "type": "number"
+        },
+        "fill_opacity": {
+          "default": 0.6,
+          "title": "Fill Opacity",
+          "type": "number"
+        }
+      },
+      "title": "LayerStyle",
+      "type": "object"
+    },
+    "LegendItem": {
+      "properties": {
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "role": {
+          "description": "Palette role key resolved at render time, e.g. 'seq:2', 'cat:0', 'div:pos:2'",
+          "title": "Role",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "role"
+      ],
+      "title": "LegendItem",
+      "type": "object"
+    }
+  },
+  "description": "Renderer-independent description of one map layer (schema version 1.0).",
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "artifact_id": {
+      "title": "Artifact Id",
+      "type": "string"
+    },
+    "render": {
+      "enum": [
+        "points",
+        "cluster",
+        "heatmap",
+        "choropleth",
+        "lines",
+        "polygons"
+      ],
+      "title": "Render",
+      "type": "string"
+    },
+    "geometry_kind": {
+      "enum": [
+        "point",
+        "line",
+        "polygon",
+        "mixed"
+      ],
+      "title": "Geometry Kind",
+      "type": "string"
+    },
+    "style": {
+      "$ref": "#/$defs/LayerStyle"
+    },
+    "tooltip": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Tooltip",
+      "type": "array"
+    },
+    "legend_title": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Legend Title"
+    },
+    "legend": {
+      "items": {
+        "$ref": "#/$defs/LegendItem"
+      },
+      "title": "Legend",
+      "type": "array"
+    },
+    "visible": {
+      "default": true,
+      "title": "Visible",
+      "type": "boolean"
+    },
+    "feature_count": {
+      "default": 0,
+      "title": "Feature Count",
+      "type": "integer"
+    },
+    "bounds": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Bounds"
+    },
+    "synthetic": {
+      "default": false,
+      "title": "Synthetic",
+      "type": "boolean"
+    },
+    "provenance": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Provenance",
+      "type": "array"
+    },
+    "z_index": {
+      "default": 0,
+      "title": "Z Index",
+      "type": "integer"
+    },
+    "note": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Note"
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "artifact_id",
+    "render",
+    "geometry_kind"
+  ],
+  "title": "MapLayerSpec",
+  "type": "object"
+}

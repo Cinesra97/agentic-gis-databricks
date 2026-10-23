@@ -1,0 +1,27 @@
+# Databricks Apps manifest (optional deployment target; NOT tested in this repository's CI).
+# See docs/DATABRICKS.md#deploying-as-a-databricks-app before using.
+#
+# Add a SQL warehouse resource to the app with the key "sql-warehouse" (Can use permission).
+# The app's service principal authenticates with OAuth M2M (DATABRICKS_CLIENT_ID/SECRET and
+# DATABRICKS_HOST are injected by Databricks Apps). Grant it read-only access in Unity Catalog.
+command: ["streamlit", "run", "app.py"]
+
+env:
+  - name: AGIS_MODE
+    value: "databricks"
+  - name: DATABRICKS_AUTH_TYPE
+    value: "oauth-m2m"
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: "sql-warehouse"
+  - name: DATABRICKS_CATALOG
+    value: "dsny_sandbox"
+  - name: DATABRICKS_SCHEMA
+    value: "egpmo_sandbox"
+  # Ollama is not available inside Databricks Apps. Use the deterministic planner, or point the
+  # openai_compatible provider at an organization-approved endpoint (requires AGIS_ALLOW_EXTERNAL_LLM).
+  - name: AGIS_LLM_PROVIDER
+    value: "demo"
+  - name: AGIS_SQL_APPROVAL
+    value: "generated"
+  - name: AGIS_AUDIT_LOG_PATH
+    value: "/tmp/agentic-gis-audit.jsonl"
