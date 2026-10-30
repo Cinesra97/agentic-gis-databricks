@@ -58,6 +58,14 @@ def test_socrata_ingest(tmp_path, registry):
     assert "created_date >= '2024-01-01T00:00:00'" in seen[0]["$where"]
     meta = json.loads(Path(res.path).with_suffix(".provenance.json").read_text())
     assert meta["socrata_id"] == "erm2-nwe9" and meta["rows"] == 25
+    # the sidecar records whether the download hit its row limit (26 fetched = limit 26)
+    assert meta["limit"] == 26 and meta["fetched_rows"] == 26 and meta["limit_reached"] is True
+    assert meta["date_min"] == meta["date_max"] == "2024-02-01" and res.limit_reached
+    from agentic_gis.connectors.coverage import profile_frame
+
+    cov = profile_frame(ds, g)
+    assert cov.limit_reached and cov.is_subset and cov.date_min == "2024-02-01"
+    assert any("26-row limit" in n and "most recent" in n for n in cov.notes)
     with pytest.raises(ValueError):
         ingest_dataset(ds, client, since="2024-13-45")
 

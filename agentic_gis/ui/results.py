@@ -126,10 +126,12 @@ def render_data_scope(turn: TurnResult, compact: bool = True) -> None:
         )
         if rows:
             st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        shown = set(ds.get("warnings", []))
         for d in ds.get("datasets", []):
             cov = d.get("coverage") or {}
             for n in cov.get("notes") or []:
-                st.caption(f"• {d.get('name')}: {n}")
+                if f"{d.get('name')}: {n}" not in shown:
+                    st.caption(f"• {d.get('name')}: {n}")
             if cov.get("ingest_where"):
                 st.caption(f"• {d.get('name')} ingestion filter: `{cov['ingest_where']}`")
     for w in ds.get("warnings", []):

@@ -140,6 +140,7 @@ with left:
                             "awaiting_approval": "SQL needs your approval",
                             "clarification": "Need a detail",
                             "complete": "Analysis complete",
+                            "insufficient_coverage": "The stored data does not cover the requested period",
                         }.get(res.status, res.status)
                         status.update(label=label, state="complete")
                     except Exception as exc:  # keep the UI alive; details are in the log
@@ -169,7 +170,9 @@ def _context_boroughs() -> tuple[list[MapLayerSpec], dict[str, gpd.GeoDataFrame]
 
 
 with right:
-    turns: list[TurnResult] = [t for t in session.history if t.layers or t.steps]
+    turns: list[TurnResult] = [
+        t for t in session.history if t.layers or t.steps or t.status == "insufficient_coverage"
+    ]
     view: TurnResult | None = None
     if turns:
         opts = list(range(len(turns)))

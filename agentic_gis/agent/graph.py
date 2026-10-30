@@ -27,6 +27,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -101,6 +102,7 @@ class AgentRuntime:
     session_id: str
     approved: set[str] = field(default_factory=set)
     llm_message: str = ""
+    today: date | None = None  # reference date for relative periods ("last 6 months"); None = today
     _vocabulary: Vocabulary | None = None
 
     def tool_context(
@@ -384,7 +386,7 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
         ctx = rt.tool_context(turn)
         context = state.get("context") or {}
         prev_intent = context.get("last_intent")
-        rules = RulePlanner(rt.registry, rt.mode, rt.vocabulary)
+        rules = RulePlanner(rt.registry, rt.mode, rt.vocabulary, today=rt.today)
         feedback = state.get("replan_feedback")
         notes: list[str] = []
         trace = list(state.get("trace", []))
@@ -1026,7 +1028,10 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
                         narrative_rejected = problems
                         rt.audit.log("narrative_rejected", rt.session_id, turn=turn, problems=problems)
                     else:
-                        answer, narrator = candidate, rt.llm.label
+                        # computed caveats (coverage, failed/skipped steps, row limits) always stay
+                        merged = list(dict.fromkeys([*template.limitations, *candidate.limitations]))
+                        answer = candidate.model_copy(update={"limitations": merged[:8]})
+                        narrator = rt.llm.label
                 except LLMError as exc:
                     adjustments.append(
                         f"LLM narration unavailable ({str(exc)[:120]}); used template summary."
