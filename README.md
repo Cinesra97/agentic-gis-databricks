@@ -53,13 +53,15 @@ Follow-ups keep context: “Now show only Brooklyn”, “Which of those are nea
 
 ```mermaid
 flowchart LR
-  Q[Question] --> S[start] --> D[discover<br/>dataset registry] --> P[plan<br/>Ollama JSON plan<br/>or deterministic]
-  P --> R[review_sql<br/>SQLGlot AST guard]
+  Q[Question] --> S[start] --> D[discover<br/>dataset registry] --> P[plan<br/>Ollama JSON plan<br/>or deterministic<br/>+ request-scope check]
+  P --> C[check_coverage<br/>stored dates vs request]
+  C --> R[review_sql<br/>SQLGlot AST guard]
+  C -->|period not stored| O
   R -->|new SQL| A{{approve<br/>LangGraph interrupt}}
   R --> E[execute<br/>validated tools]
   A -->|approved| E
   A -->|rejected| O
-  E --> F[reflect<br/>replan on failure] --> Z[finalize<br/>map layers, citations] --> O[respond<br/>narrative + guardrails]
+  E --> F[reflect<br/>replan on real errors] --> Z[finalize<br/>map layers, citations] --> O[respond<br/>fact-checked narrative + guardrails]
 ```
 
 * The LLM never executes code. It returns a **JSON plan** of calls to registered tools
@@ -67,6 +69,10 @@ flowchart LR
   `find_hotspots`, `analyze_temporal_patterns`, `compare_periods`, `generate_map_layer`, …), validated with
   Pydantic. Raw SQL (`query_local_data` / `query_databricks`) is allowed only as a single read-only SELECT
   over allowlisted tables and needs your approval.
+* Every plan is checked against what the question asked (period, boroughs, categories, places, distances),
+  parsed deterministically: filters the question did not ask for — such as a date range the model made up —
+  are removed and shown as corrections. Questions about periods that are not in the stored data get an
+  “insufficient coverage” answer, and the LLM's answer is checked against the computed numbers.
 * Results live in a per-session artifact store; map layers follow a **standard JSON schema**
   ([docs/MAP_LAYERS.md](docs/MAP_LAYERS.md)) rendered by Leaflet (Folium) or deck.gl (PyDeck).
 * Answers separate **observations** (computed), **inferences** (interpretation) and **verified** findings

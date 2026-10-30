@@ -77,8 +77,24 @@ uv run agentic-gis ingest nyc_311_sanitation --since 2024-01-01 --limit 100000
 ```
 
 Ingestion writes GeoParquet to `data/ingested/` (git-ignored) plus a `.provenance.json` sidecar (portal id,
-filter, row count, retrieval time). Ingestion is an operator action; the agent never calls web APIs on its
-own. Add more Socrata datasets by adding entries with `source.type: socrata`.
+filter, order, row limit, rows fetched, whether the limit was reached, stored date range, retrieval time).
+Ingestion is an operator action; the agent never calls web APIs on its own. Add more Socrata datasets by
+adding entries with `source.type: socrata`.
+
+**Stored coverage is not the configured window.** With `order: created_date DESC` and `limit: 150000`, a
+download keeps only the most recent 150,000 matching records; with the full 311 dataset that can be a few
+months, not “since 2023”. At startup the app measures each local dataset's row count and earliest/latest
+date from the loaded data (no extra file scan) and combines it with the sidecar:
+
+* `uv run agentic-gis check` prints the stored range per dataset and flags truncated downloads;
+* the sidebar *Data catalog* shows stored rows and dates;
+* questions about a period outside the stored range get an “insufficient coverage” answer instead of an
+  empty result; partial overlaps and truncated downloads are disclosed in the answer.
+
+To cover a longer period, ingest it explicitly, e.g.
+`uv run agentic-gis ingest nyc_311_sanitation --since 2024-01-01 --limit 1000000` (mind memory: DuckDB and
+GeoPandas hold the data in RAM), or narrow the `where` filter in `config/datasets.local.yaml`. Older
+sidecars without the new fields are still read; the configured limit is then assumed.
 
 ## Adding a local file dataset
 

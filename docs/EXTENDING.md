@@ -35,7 +35,13 @@ Pass the registry to `create_runtime(..., tools=registry)`. Rules:
 * If the tool runs SQL, provide `sql_renderer=` so the SQL is validated and shown for approval *before*
   execution, and execute it through `ctx.run_sql(...)`.
 * Put method parameters and caveats in `notes`; they appear in the methodology section.
-* Add tests in `tests/` (see `tests/test_tools.py`).
+* Return `status="empty"` with a `reason` (`empty_result`, `zero_clusters`, …) when a result has no rows, and
+  put key numbers in `facts` (they are used to check LLM answers). The graph skips a step whose input has
+  zero rows unless the tool is registered with `accepts_empty_input=True`.
+* If the tool has parameters a question can constrain (dates, places, distances), add a
+  `_check_<tool_name>` method to `agent/semantics.py::SemanticValidator` so LLM plans cannot set them
+  without the question asking for them.
+* Add tests in `tests/` (see `tests/test_tools.py` and `tests/test_reliability.py`).
 
 ## Add a dataset
 

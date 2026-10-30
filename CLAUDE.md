@@ -29,6 +29,10 @@ config/). `app.py` is the Streamlit entry point; `config/datasets.yaml` is the d
 * Every SQL path goes through `SQLGuard`; tools receive data by reference only; no tool may execute
   model-provided code, shell commands, file paths or URLs.
 * New SQL-bearing tools need a `sql_renderer` so SQL is reviewed/approved before execution.
+* Plans must stay inside the request scope parsed from the question (`agent/semantics.py`): no date, place,
+  category or attribute filter the question did not ask for. Tools with such parameters need a
+  `_check_<tool>` in `SemanticValidator`. Empty results are "no matching records", never "no incidents";
+  periods outside the stored coverage get an insufficient-coverage answer.
 * Keep synthetic data labeled (`synthetic: true`, `is_synthetic`, titles, answers). Never describe
   complaint locations as confirmed violations; imagery results are candidates.
 * Distances/areas in a projected CRS (`settings.projected_crs`, EPSG:2263 default).
