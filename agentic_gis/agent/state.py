@@ -60,6 +60,9 @@ class AgentState(TypedDict, total=False):
     plan: dict[str, Any] | None
     plan_source: str
     intent: dict[str, Any] | None
+    scope: dict[str, Any] | None  # request scope parsed from the question (semantics.QuestionScope)
+    validation: list[dict[str, Any]]  # corrections / rejections made by the semantic validator
+    data_scope: dict[str, Any] | None  # datasets, requested period, stored coverage, record counts
     sql_reviews: list[dict[str, Any]]
     approval: dict[str, Any] | None
     steps: list[dict[str, Any]]

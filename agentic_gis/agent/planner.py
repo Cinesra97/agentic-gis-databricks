@@ -14,9 +14,11 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import date
 from typing import Any
 
 from agentic_gis.agent.state import Plan, PlanStep
+from agentic_gis.agent.temporal import parse_time_window
 from agentic_gis.agent.tools import BOROUGH_ALIASES, ToolRegistry
 from agentic_gis.agent.workspace import ResultStore
 from agentic_gis.config.registry import DatasetRegistry, DatasetSpec
@@ -107,6 +109,8 @@ class Intent:
     units: str = "ft"
     date_from: str | None = None
     date_to: str | None = None
+    time_kind: str = "none"  # see agentic_gis.agent.temporal.TimeWindow.kind
+    time_phrase: str | None = None
     freq: str | None = None
     group_by: str | None = None
     geography: str | None = None
@@ -114,6 +118,8 @@ class Intent:
     use_previous: bool = False
     clarification: str | None = None
     notes: list[str] = field(default_factory=list)
+    categories_by_dataset: dict[str, list[str]] = field(default_factory=dict)
+    context_questions: list[str] = field(default_factory=list)  # earlier questions this one builds on
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -137,10 +143,17 @@ def _first_pos(text: str, terms: list[str]) -> int:
 
 
 class RulePlanner:
-    def __init__(self, registry: DatasetRegistry, mode: str, vocabulary: Vocabulary | None = None):
+    def __init__(
+        self,
+        registry: DatasetRegistry,
+        mode: str,
+        vocabulary: Vocabulary | None = None,
+        today: date | None = None,
+    ):
         self.registry = registry
         self.mode = mode
         self.vocab = vocabulary or Vocabulary()
+        self.today = today
 
     # ---------------------------------------------------------------------------------------
     # Intent parsing
@@ -212,17 +225,11 @@ class RulePlanner:
         )
         if m:
             it.min_points = int(m.group(1)) + (1 if re.search(r"more than|over", m.group(0)) else 0)
-        years = sorted({int(y) for y in re.findall(r"\b(20[0-3]\d)\b", q)})
-        if re.search(r"\b(since|after|from)\s+20[0-3]\d\b", ql) and years:
-            it.date_from = f"{years[0]}-01-01"
-            if len(years) > 1:
-                it.date_to = f"{years[-1]}-12-31"
-        elif re.search(r"\bbetween\s+20[0-3]\d\s+and\s+20[0-3]\d\b", ql) and len(years) >= 2:
-            it.date_from, it.date_to = f"{years[0]}-01-01", f"{years[-1]}-12-31"
-        elif re.search(r"\b(before|until|through)\s+20[0-3]\d\b", ql) and years:
-            it.date_to = f"{years[-1]}-12-31"
-        elif len(years) == 1:
-            it.date_from, it.date_to = f"{years[0]}-01-01", f"{years[0]}-12-31"
+        # Time period: only words in the question count (never dataset titles or descriptions).
+        tw = parse_time_window(q, self.today)
+        it.date_from, it.date_to = tw.date_from, tw.date_to
+        it.time_kind, it.time_phrase = tw.kind, tw.phrase
+        it.notes.extend(tw.notes)
         for f in ("week", "month", "quarter", "year"):
             if re.search(rf"\b(by|per|each|every) {f}\b|\b{f}ly\b|\b{f}\b", ql):
                 it.freq = f
@@ -290,6 +297,7 @@ class RulePlanner:
             )
         it.categories = cats_by_ds.get(it.subject_dataset or "", [])
         it.reference_categories = cats_by_ds.get(it.reference_dataset or "", [])
+        it.categories_by_dataset = {k: v for k, v in cats_by_ds.items() if v}
 
         # --- clarification: streets referenced but not named ---------------------------------------
         needs_names = (
@@ -364,6 +372,11 @@ class RulePlanner:
         merged.question = it.question
         merged.clarification = it.clarification
         merged.notes = [f"Follow-up to: “{prev.question}”"]
+        merged.context_questions = [*prev.context_questions, prev.question][-3:]
+        merged.categories_by_dataset = {
+            **prev.categories_by_dataset,
+            **{k: v for k, v in it.categories_by_dataset.items() if v},
+        }
         if prev.clarification and it.street_names:
             merged.street_names = it.street_names
             merged.clarification = None
@@ -380,8 +393,34 @@ class RulePlanner:
             merged.street_names = it.street_names
         if it.distance is not None:
             merged.distance, merged.units = it.distance, it.units
-        if it.date_from or it.date_to:
+        if it.time_kind == "all":
+            merged.date_from = merged.date_to = None
+            merged.time_kind, merged.time_phrase = "all", it.time_phrase
+            if prev.date_from or prev.date_to:
+                merged.notes.append("Removed the previous date range; using all available dates.")
+        elif it.date_from or it.date_to:
             merged.date_from, merged.date_to = it.date_from, it.date_to
+            merged.time_kind, merged.time_phrase = it.time_kind, it.time_phrase
+            prev_year = (
+                prev.date_from[:4]
+                if prev.date_from and prev.date_to and prev.date_from[:4] == prev.date_to[:4]
+                else None
+            )
+            if it.time_kind == "month" and prev_year and it.date_from and it.date_to:
+                if it.date_from[:4] == it.date_to[:4]:  # "only June" after "... in 2023" -> June 2023
+                    merged.date_from = prev_year + it.date_from[4:]
+                    merged.date_to = prev_year + it.date_to[4:]
+                    if merged.date_to[5:] == "02-29" and int(prev_year) % 4:
+                        merged.date_to = prev_year + "-02-28"
+                    merged.notes.append(
+                        f"Used the year of the previous question ({prev_year}) for '{it.time_phrase}'."
+                    )
+            else:
+                merged.notes += [n for n in it.notes if n.startswith(("No year given", "'"))]
+        elif prev.date_from or prev.date_to:
+            merged.notes.append(
+                f"Kept the date range of the previous question ({prev.date_from or '…'} to {prev.date_to or '…'})."
+            )
         if it.min_points:
             merged.min_points = it.min_points
         if it.explicit_analysis:
@@ -669,7 +708,9 @@ class RulePlanner:
 # =========================================================================================
 # LLM planner prompt
 # =========================================================================================
-def dataset_digest(ds: DatasetSpec, level: str, live_columns: list[Any] | None = None) -> str:
+def dataset_digest(
+    ds: DatasetSpec, level: str, live_columns: list[Any] | None = None, coverage: Any = None
+) -> str:
     if level == "name_only":
         return f"- {ds.id}: {ds.label} [{ds.role}] (details withheld by data policy)"
     geom = ds.spatial.geometry_type if ds.spatial else "none"
@@ -696,6 +737,8 @@ def dataset_digest(ds: DatasetSpec, level: str, live_columns: list[Any] | None =
             parts.append(f"    columns: {', '.join(cols)}")
         if ds.name_column:
             parts.append(f"    name column: {ds.name_column}")
+    if coverage is not None and getattr(coverage, "known", False) and level != "name_only":
+        parts.append(f"    stored data: {coverage.describe()}")
     return "\n".join(parts)
 
 
@@ -709,6 +752,7 @@ def build_planner_prompt(
     context: dict[str, Any],
     store: ResultStore,
     turn: int,
+    scope: Any = None,
 ) -> str:
     from agentic_gis.agent.prompts import PLANNER_USER
 
@@ -721,7 +765,8 @@ def build_planner_prompt(
                 live = ctx.columns_for(d)
             except Exception as exc:  # permission or connectivity problems: plan without columns
                 log.info("Schema discovery for %s failed: %s", d.id, exc)
-        digests.append(dataset_digest(d, level, live))
+        cov = ctx.coverage(d.id) if ctx is not None and hasattr(ctx, "coverage") else None
+        digests.append(dataset_digest(d, level, live, cov))
     datasets = "\n".join(digests)
     ctx_lines = []
     if context.get("last_question"):
@@ -735,6 +780,7 @@ def build_planner_prompt(
         ctx_lines.append(wrap_untrusted("conversation", prev))
     return PLANNER_USER.format(
         question=clean_text(question, 1000)[0],
+        scope=(scope.prompt_text() + "\n") if scope is not None else "",
         mode=mode,
         geographies=", ".join(registry.geography_roles(mode)),
         context="\n".join(ctx_lines) + ("\n" if ctx_lines else ""),

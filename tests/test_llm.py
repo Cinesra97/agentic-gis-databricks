@@ -167,9 +167,10 @@ def test_unsafe_llm_sql_is_blocked_and_replanned(tmp_path, registry, demo_engine
 def test_narration_guardrails(tmp_path, registry, demo_engine):
     narr = json.dumps(
         {
-            "headline": "Bushwick has an illegal dumping site",
+            # grounded in the results (Queens is in them) but worded as a confirmed violation
+            "headline": "Queens has an illegal dumping site",
             "summary": "These are confirmed violations.",
-            "findings": [{"kind": "verified", "text": "Site 23 is an illegal dumping site."}],
+            "findings": [{"kind": "verified", "text": "Queens is an illegal dumping site."}],
             "limitations": [],
             "suggested_follow_ups": [],
         }

@@ -35,6 +35,7 @@ from agentic_gis.agent.workspace import Artifact, ResultStore
 from agentic_gis.config.registry import DatasetRegistry, DatasetSpec, UnknownDatasetError
 from agentic_gis.config.settings import Settings
 from agentic_gis.connectors.base import ColumnInfo, ConnectorError, QueryEngine
+from agentic_gis.connectors.coverage import DatasetCoverage
 from agentic_gis.security.audit import AuditLogger
 from agentic_gis.security.sanitize import clean_text
 from agentic_gis.security.sql_guard import SQLGuard, SQLPolicy, SQLValidationResult
@@ -78,8 +79,26 @@ def normalize_borough(name: str) -> str | None:
 # =========================================================================================
 # Registry infrastructure
 # =========================================================================================
+# Why a step ended the way it did (``ToolOutput.reason`` and execution records).
+FAILURE_REASONS = {
+    "error",
+    "blocked_by_policy",
+    "needs_approval",
+    "unavailable",
+    "dependency_failed",
+    "missing_input",
+}
+EMPTY_REASONS = {"empty_filter", "empty_result", "zero_clusters", "empty_input"}
+
+
 class ToolOutput(BaseModel):
-    status: Literal["ok", "error", "empty", "needs_approval", "unavailable"] = "ok"
+    status: Literal["ok", "error", "empty", "skipped", "needs_approval", "unavailable"] = "ok"
+    reason: str | None = Field(
+        None,
+        description="ok | empty_filter | empty_result | zero_clusters | empty_input | error | "
+        "needs_approval | unavailable (graph adds dependency_failed, missing_input, blocked_by_policy)",
+    )
+    facts: dict[str, Any] = Field(default_factory=dict, description="Structured results for grounding")
     summary: str = ""
     headline: str | None = Field(None, description="One-line takeaway when this step is the main result")
     highlights: list[str] = Field(default_factory=list)
@@ -126,10 +145,19 @@ class ToolContext:
     layers: list[dict[str, Any]] = field(default_factory=list)
     schema_cache: dict[str, list[ColumnInfo]] = field(default_factory=dict)
     reference_cache: dict[str, gpd.GeoDataFrame] = field(default_factory=dict)
+    scope: dict[str, Any] | None = None  # request scope (semantics.QuestionScope) for LLM SQL checks
 
     # ---- datasets -----------------------------------------------------------------------
     def dataset(self, dataset_id: str) -> DatasetSpec:
         return self.registry.get(dataset_id, self.mode)
+
+    def coverage(self, dataset_id: str) -> DatasetCoverage | None:
+        """Measured coverage of a loaded local dataset (None when not measured, e.g. Databricks)."""
+        for engine in self.engines.values():
+            cov = getattr(engine, "coverage", None)
+            if isinstance(cov, dict) and dataset_id in cov:
+                return cov[dataset_id]
+        return None
 
     def engine_for(self, ds: DatasetSpec) -> QueryEngine:
         engine = self.engines.get(ds.backend)
@@ -181,7 +209,31 @@ class ToolContext:
         return kind == "llm_sql" or backend == "databricks"
 
     def validate_sql(self, rendered: RenderedSQL) -> SQLValidationResult:
-        return self.guard.validate(rendered.sql, self.policy_for(rendered.backend))
+        policy = self.policy_for(rendered.backend)
+        review = self.guard.validate(rendered.sql, policy)
+        if rendered.kind == "llm_sql" and self.scope is not None and review.ok:
+            # Same request-scope policy as structured filters: model SQL cannot add date,
+            # borough, category or other filters the question did not ask for.
+            from agentic_gis.agent.semantics import QuestionScope, check_sql_scope
+
+            out = check_sql_scope(
+                rendered.sql,
+                policy.dialect,
+                QuestionScope.from_dict(self.scope),
+                self.registry,
+                self.mode,
+                rendered.backend,
+                self.settings.max_result_rows,
+            )
+            problems = out.violations + [c.message for c in out.corrections if c.kind == "removed"]
+            if problems:
+                review = review.model_copy(
+                    update={
+                        "ok": False,
+                        "errors": [*review.errors, *("Request scope: " + x for x in problems)],
+                    }
+                )
+        return review
 
     def run_sql(self, rendered: RenderedSQL) -> tuple[pd.DataFrame, SQLValidationResult, Any]:
         review = self.validate_sql(rendered)
@@ -307,6 +359,7 @@ class ToolSpec:
     category: str = "analysis"
     sql_renderer: Callable[[ToolContext, Any], RenderedSQL] | None = None
     available: Callable[[ToolContext], bool] | None = None
+    accepts_empty_input: bool = False  # e.g. summaries can describe an empty result
 
     @property
     def ref_fields(self) -> list[str]:
@@ -358,9 +411,14 @@ class ToolRegistry:
         category: str = "analysis",
         sql_renderer: Callable[[ToolContext, Any], RenderedSQL] | None = None,
         available: Callable[[ToolContext], bool] | None = None,
+        accepts_empty_input: bool = False,
     ) -> Callable[[Callable], Callable]:
         def deco(fn: Callable[[ToolContext, Any], ToolOutput]) -> Callable:
-            self.register(ToolSpec(name, description, args_model, fn, category, sql_renderer, available))
+            self.register(
+                ToolSpec(
+                    name, description, args_model, fn, category, sql_renderer, available, accepts_empty_input
+                )
+            )
             return fn
 
         return deco
@@ -429,6 +487,10 @@ class ToolRegistry:
             log.exception("Tool %s failed", name)
             out = ToolOutput(status="error", summary=f"{name} failed unexpectedly ({type(exc).__name__}).")
         out.elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        if out.reason is None:
+            out.reason = {"ok": "ok", "empty": "empty_result", "skipped": "empty_input"}.get(
+                out.status, out.status
+            )
         ctx.audit.log(
             "tool_call",
             ctx.session_id,
@@ -437,6 +499,7 @@ class ToolRegistry:
             tool=name,
             args=_safe_args(raw_args),
             status=out.status,
+            reason=out.reason,
             rows=out.rows,
             elapsed_ms=out.elapsed_ms,
             summary=out.summary[:300],
@@ -447,7 +510,8 @@ class ToolRegistry:
 def _empty_input(art: Artifact, what: str) -> ToolOutput | None:
     if art.rows == 0:
         return ToolOutput(
-            status="empty",
+            status="skipped",
+            reason="empty_input",
             summary=f"Skipped {what}: the input '{art.title}' has no records.",
             artifact_id=None,
             rows=0,
@@ -1018,8 +1082,20 @@ def build_default_registry() -> ToolRegistry:
             title += " in " + ", ".join(b.title() for b in a.boroughs)
         art = ctx.save(title, data, "filter_dataset", datasets=[ds.id], sql=review.sql, notes=notes)
         status = "ok" if len(data) else "empty"
+        facts = {
+            "dataset": ds.id,
+            "rows": len(data),
+            "date_from": a.date_from,
+            "date_to": a.date_to,
+            "categories": eval_list(cats[0]) if cats else (a.categories or []),
+            "boroughs": a.boroughs or [],
+            "filters": [f.model_dump() for f in a.filters],
+            "truncated": bool(result.truncated),
+        }
         return ToolOutput(
             status=status,
+            reason="ok" if len(data) else "empty_filter",
+            facts=facts,
             summary=f"Read {len(data):,} rows from {ds.id}.",
             headline=f"{len(data):,} {title}",
             artifact_id=art.id,
@@ -1050,6 +1126,7 @@ def build_default_registry() -> ToolRegistry:
         )
         return ToolOutput(
             status="ok" if len(data) else "empty",
+            facts={"rows": len(data), "datasets": review.datasets, "truncated": bool(result.truncated)},
             summary=f"Query returned {len(data):,} rows.",
             artifact_id=art.id,
             rows=len(data),
@@ -1117,6 +1194,7 @@ def build_default_registry() -> ToolRegistry:
             hl.append(f"{len(out):,} of {len(lg):,} '{la.title}' features have at least one match{dist}.")
         return ToolOutput(
             status="ok" if len(out) else "empty",
+            facts={"matched": len(out), "left_rows": len(lg), "right_rows": len(rg), "distance": a.distance},
             summary=f"{len(out):,} {la.title} features matched{dist} of {ra.title}.",
             headline=f"{len(out):,} of {len(lg):,} {la.title} are {rel} {ra.title}",
             highlights=hl,
@@ -1242,6 +1320,7 @@ def build_default_registry() -> ToolRegistry:
         warnings = [f"No match for: {', '.join(unmatched)}"] if unmatched else []
         return ToolOutput(
             status="ok" if len(out) else "empty",
+            facts={"rows": len(out), "input_rows": len(ig), "areas": areas[label].astype(str).tolist()[:20]},
             summary=f"{len(out):,} of {len(ig):,} features fall in {names}.",
             artifact_id=art.id,
             rows=len(out),
@@ -1353,8 +1432,12 @@ def build_default_registry() -> ToolRegistry:
                     + ", ".join(f"{r[label]} ({r['value']:,.0f})" for _, r in out.iloc[1:4].iterrows())
                     + "."
                 )
+        facts: dict[str, Any] = {"areas": len(out), "input_rows": len(ig), "measure": measure}
+        if len(out):
+            facts["top_value"] = float(out.iloc[0]["value"])
         return ToolOutput(
             status="ok" if len(out) else "empty",
+            facts=facts,
             summary=f"Aggregated {len(ig):,} features into {len(out):,} {what} ({measure}).",
             headline=headline,
             highlights=hl,
@@ -1391,6 +1474,14 @@ def build_default_registry() -> ToolRegistry:
                     f"Strongest cell has {int(hot.iloc[0]['count'])} reports (Gi* z = {hot.iloc[0]['gi_z']})."
                 )
             return ToolOutput(
+                facts={
+                    "method": "gi_star",
+                    "input_rows": len(ig),
+                    "cells": len(out),
+                    "hot_cells_90": int(len(hot)),
+                    "hot_cells_95": int(res.stats["hot_cells_95"]),
+                    "clusters": int(len(hot)),
+                },
                 summary=f"Gi* hot spot analysis on {a.cell_size:g} {a.units} cells.",
                 highlights=hl,
                 headline=f"{res.stats['hot_cells_95']:,} grid cells ({a.cell_size:g} {a.units}) are "
@@ -1421,6 +1512,15 @@ def build_default_registry() -> ToolRegistry:
         hl = [
             f"{res.stats['clusters']} clusters contain {res.stats['clustered_points']:,} of {len(ig):,} reports."
         ]
+        facts = {
+            "method": "clusters",
+            "input_rows": len(ig),
+            "clusters": int(res.stats["clusters"]),
+            "clustered_points": int(res.stats["clustered_points"]),
+            "radius": a.radius,
+            "units": a.units,
+            "min_points": a.min_points,
+        }
         if len(out):
             top = out.iloc[0]
             where = top.get("incident_address") or top.get("street_name") or top.get("cd_code") or ""
@@ -1431,12 +1531,21 @@ def build_default_registry() -> ToolRegistry:
                 else ""
             )
             hl.append(f"Largest cluster: {int(top['count'])} reports{span} near {where} {boro}".strip() + ".")
+            facts["largest_count"] = int(top["count"])
+            facts["largest_near"] = f"{where} {boro}".strip()
+        headline = (
+            f"{len(out)} locations with {a.min_points}+ {ia.title} within {a.radius:g} {a.units} of each other"
+            if len(out)
+            else f"No location has {a.min_points}+ of the {len(ig):,} {ia.title} within {a.radius:g} {a.units} "
+            "of each other"
+        )
         return ToolOutput(
             status="ok" if len(out) else "empty",
+            reason="ok" if len(out) else "zero_clusters",
+            facts=facts,
             summary=f"Found {len(out)} clusters of ≥{a.min_points} reports within {a.radius:g} {a.units}.",
             highlights=hl,
-            headline=f"{len(out)} locations with {a.min_points}+ {ia.title} within "
-            f"{a.radius:g} {a.units} of each other",
+            headline=headline,
             artifact_id=art.id,
             rows=len(out),
             notes=res.notes,
@@ -1489,6 +1598,11 @@ def build_default_registry() -> ToolRegistry:
             )
         return ToolOutput(
             headline=headline,
+            facts={
+                "date_min": res.stats["date_min"][:10],
+                "date_max": res.stats["date_max"][:10],
+                "total": int(summary_df["total"].sum()) if "total" in summary_df else None,
+            },
             summary=f"Temporal pattern of {ia.title} ({res.stats['date_min'][:10]} to "
             f"{res.stats['date_max'][:10]}).",
             highlights=hl,
@@ -1562,6 +1676,13 @@ def build_default_registry() -> ToolRegistry:
                 + "."
             )
         return ToolOutput(
+            facts={
+                "period_a": res.stats["period_a"],
+                "period_b": res.stats["period_b"],
+                "total_a": int(res.stats["total_a"]),
+                "total_b": int(res.stats["total_b"]),
+                "areas": len(out),
+            },
             summary=f"Compared {res.stats['period_a']} with {res.stats['period_b']} across "
             f"{len(out)} {a.geography} areas.",
             highlights=hl,
@@ -1666,6 +1787,7 @@ def build_default_registry() -> ToolRegistry:
         "Describe a result: row count, top categories, date range, numeric ranges.",
         SummarizeArgs,
         category="output",
+        accepts_empty_input=True,
     )
     def summarize_results(ctx: ToolContext, a: SummarizeArgs) -> ToolOutput:
         art = ctx.resolve(a.input)

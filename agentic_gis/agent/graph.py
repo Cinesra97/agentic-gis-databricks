@@ -1,11 +1,15 @@
 """LangGraph workflow for the GIS agent.
 
-    start -> discover -> plan -> review_sql -> [approve] -> execute -> reflect -> finalize -> respond
-                          ^                                              |
-                          +------------------ replan (LLM only) ---------+
+    start -> discover -> plan -> check_coverage -> review_sql -> [approve] -> execute -> reflect
+                          ^                                                                  |
+                          +---------------------- replan (LLM only, real errors) ------------+
+    reflect -> finalize -> respond        (check_coverage -> respond when the period is not stored)
 
 * ``plan`` asks the LLM for a JSON plan (validated against tool schemas and the dataset
-  allowlist; one repair attempt) and falls back to the deterministic planner.
+  allowlist; one repair attempt), then checks it against the request scope parsed from the
+  question (``semantics``): unrequested dates/filters are removed, plans that cannot be fixed
+  fall back to the deterministic planner.
+* ``check_coverage`` compares the requested period with the dates actually stored.
 * ``review_sql`` renders and validates every SQL statement the plan will run.
 * ``approve`` pauses the graph with :func:`langgraph.types.interrupt` until the user approves
   or rejects newly generated SQL (configurable via ``AGIS_SQL_APPROVAL``).
@@ -29,22 +33,34 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+from agentic_gis.agent.grounding import build_evidence, check_narrative
 from agentic_gis.agent.llm import LLMClient, LLMError, LLMOutputError, LLMUnavailableError, build_llm
 from agentic_gis.agent.narrative import (
     citations_for,
+    coverage_answer,
     datasets_for_llm,
     enforce_guardrails,
+    main_selection,
     step_digest_for_llm,
     template_answer,
 )
 from agentic_gis.agent.planner import RulePlanner, Vocabulary, build_planner_prompt, validate_plan
 from agentic_gis.agent.prompts import NARRATOR_SYSTEM, NARRATOR_USER, PLANNER_SYSTEM
+from agentic_gis.agent.semantics import Correction, QuestionScope, SemanticValidator, sql_datasets
 from agentic_gis.agent.state import AgentState, Answer, Plan
-from agentic_gis.agent.tools import ToolContext, ToolRegistry, build_default_registry
+from agentic_gis.agent.temporal import describe_window
+from agentic_gis.agent.tools import (
+    EMPTY_REASONS,
+    FAILURE_REASONS,
+    ToolContext,
+    ToolRegistry,
+    build_default_registry,
+)
 from agentic_gis.agent.workspace import Artifact, ResultStore
 from agentic_gis.config.registry import DatasetRegistry, DatasetSpec, UnknownDatasetError, load_registry
 from agentic_gis.config.settings import Settings, get_settings
 from agentic_gis.connectors.base import QueryEngine
+from agentic_gis.connectors.coverage import unknown_coverage
 from agentic_gis.security.audit import AuditLogger
 from agentic_gis.security.policy import DataEgressPolicy
 from agentic_gis.security.sanitize import wrap_untrusted
@@ -87,7 +103,9 @@ class AgentRuntime:
     llm_message: str = ""
     _vocabulary: Vocabulary | None = None
 
-    def tool_context(self, turn: int, step_id: str = "s0") -> ToolContext:
+    def tool_context(
+        self, turn: int, step_id: str = "s0", scope: dict[str, Any] | None = None
+    ) -> ToolContext:
         return ToolContext(
             settings=self.settings,
             registry=self.registry,
@@ -101,6 +119,7 @@ class AgentRuntime:
             step_id=step_id,
             approved=self.approved,
             reference_cache=self._reference_cache,
+            scope=scope,
         )
 
     def __post_init__(self) -> None:
@@ -235,6 +254,99 @@ def _datasets_used(rt: AgentRuntime, ids: list[str]) -> list[DatasetSpec]:
     return out
 
 
+def build_data_scope(
+    rt: AgentRuntime,
+    ctx: ToolContext,
+    plan: Plan,
+    scope: QuestionScope,
+    source: str,
+    validation: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Datasets the plan analyzes, the requested period and filters, and the stored coverage."""
+    entries: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    area_steps: dict[str, list[Any]] = {}
+    for st in plan.steps:
+        if st.tool == "filter_by_area" and isinstance(st.args.get("input"), str):
+            area_steps.setdefault(st.args["input"], []).append(st)
+    for st in plan.steps:
+        if st.tool == "filter_dataset":
+            ids = [str(st.args.get("dataset"))]
+            req = (st.args.get("date_from"), st.args.get("date_to"))
+        elif st.tool in ("query_local_data", "query_databricks"):
+            backend = "local" if st.tool == "query_local_data" else "databricks"
+            dialect = "duckdb" if backend == "local" else "databricks"
+            ids = sql_datasets(str(st.args.get("sql", "")), dialect, rt.registry, rt.mode, backend)
+            req = (scope.date_from, scope.date_to)
+        else:
+            continue
+        for did in ids:
+            try:
+                ds = rt.registry.get_any(did)
+            except UnknownDatasetError:
+                continue
+            if ds.role != "events" and did != scope.subject_dataset:
+                continue
+            cov = ctx.coverage(did)
+            if cov is None and ds.backend == "databricks":
+                cov = unknown_coverage(
+                    ds, "Coverage of Databricks tables is not measured (it would need a query)."
+                )
+            overlap = cov.overlap(*req) if cov is not None else ("all" if not any(req) else "unknown")
+            stored = cov.describe() if cov is not None and cov.known else "coverage not measured"
+            entry = {
+                "step": st.id,
+                "tool": st.tool,
+                "dataset": did,
+                "name": ds.label,
+                "backend": ds.backend,
+                "synthetic": ds.synthetic,
+                "requested_from": req[0],
+                "requested_to": req[1],
+                "requested_text": describe_window(*req),
+                "categories": list(st.args.get("categories") or []),
+                "boroughs": list(st.args.get("boroughs") or []),
+                "filters": list(st.args.get("filters") or []),
+                "areas": [str(n) for a in area_steps.get(st.id, []) for n in a.args.get("names", [])],
+                "coverage": cov.to_dict() if cov is not None else None,
+                "overlap": overlap,
+                "matching_rows": None,
+                "summary": f"{ds.label}: requested {describe_window(*req)}; stored {stored}",
+            }
+            entries.append(entry)
+            if overlap == "none" and cov is not None:
+                warnings.append(
+                    f"You asked for {describe_window(*req)}, but {ds.label} only has records from "
+                    f"{cov.date_min} to {cov.date_max}."
+                )
+            elif overlap == "partial" and cov is not None:
+                lo = max(x for x in (req[0], cov.date_min) if x)
+                hi = min(x for x in (req[1], cov.date_max) if x)
+                warnings.append(
+                    f"Partial coverage: you asked for {describe_window(*req)}, but {ds.label} has records from "
+                    f"{cov.date_min} to {cov.date_max}; results cover {lo} to {hi} only."
+                )
+            elif overlap == "unknown" and any(req):
+                warnings.append(
+                    f"The stored date range of {ds.label} is not known; the period could not be checked."
+                )
+            if cov is not None and cov.limit_reached:
+                warnings += [f"{ds.label}: {n}" for n in cov.notes]
+    insufficient = any(e["overlap"] == "none" for e in entries)
+    return {
+        "status": "insufficient_coverage" if insufficient else ("partial" if warnings else "ok"),
+        "period": scope.period_text(),
+        "time_kind": scope.time_kind,
+        "planner": source,
+        "datasets": entries,
+        "warnings": list(dict.fromkeys(warnings)),
+        "corrections": [
+            v for v in validation if v.get("kind") in ("removed", "changed", "added", "rejected")
+        ],
+        "assumptions": [v for v in validation if v.get("kind") == "assumption"],
+    }
+
+
 def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
     settings = rt.settings
 
@@ -275,10 +387,25 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
         rules = RulePlanner(rt.registry, rt.mode, rt.vocabulary)
         feedback = state.get("replan_feedback")
         notes: list[str] = []
-        trace = state.get("trace", [])
-        intent = None
+        trace = list(state.get("trace", []))
         source = "rules"
         chosen: Plan | None = None
+        corrections: list[Correction] = []
+        # The deterministic intent is the reference for what the question asks (dates, places,
+        # categories, distances). It is cheap, so it is computed first and used to check LLM plans.
+        try:
+            p_rules, intent = rules.plan(state["effective_question"], prev_intent)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.exception("Rule planner failed")
+            p_rules, intent = Plan(interpretation="", steps=[], clarification=f"Planner error: {exc}"), None
+        scope = QuestionScope.from_intent(intent.to_dict() if intent else None, state["effective_question"])
+        validator = SemanticValidator(rt.registry, rt.mode, settings.max_result_rows)
+
+        def structural(candidate: Plan) -> Any:
+            return validate_plan(
+                candidate, rt.tools, rt.registry, rt.mode, rt.store, turn, settings.max_plan_steps, ctx
+            )
+
         if rt.llm is not None:
             try:
                 prompt = build_planner_prompt(
@@ -291,6 +418,7 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
                     context,
                     rt.store,
                     turn,
+                    scope=scope,
                 )
                 if context.get("pending_clarification"):
                     prompt += f"\n\nThe user was asked: {context['pending_clarification']}"
@@ -301,9 +429,7 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
                         + "\nWrite a corrected plan."
                     )
                 candidate = rt.llm.generate_json(PLANNER_SYSTEM, prompt, Plan, purpose="plan")
-                check = validate_plan(
-                    candidate, rt.tools, rt.registry, rt.mode, rt.store, turn, settings.max_plan_steps, ctx
-                )
+                check = structural(candidate)
                 if check.errors:
                     repair = (
                         prompt
@@ -312,20 +438,26 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
                         + "\nReturn a corrected plan."
                     )
                     candidate = rt.llm.generate_json(PLANNER_SYSTEM, repair, Plan, purpose="plan_repair")
-                    check = validate_plan(
-                        candidate,
-                        rt.tools,
-                        rt.registry,
-                        rt.mode,
-                        rt.store,
-                        turn,
-                        settings.max_plan_steps,
-                        ctx,
-                    )
+                    check = structural(candidate)
                 if check.errors:
                     notes.append("LLM plan failed validation: " + "; ".join(check.errors[:3]))
                     raise LLMOutputError("invalid plan")
-                chosen, source = check.plan, "llm"
+                # Semantic check: every LLM plan (first try, repair or replan) must stay inside the
+                # request scope. Fixable problems are corrected; others reject the plan.
+                sem = validator.check(check.plan, scope, "llm")
+                corrections += sem.corrections
+                recheck = structural(sem.plan) if not sem.rejected else None
+                if sem.rejected or (recheck is not None and recheck.errors):
+                    reasons = sem.rejected or (recheck.errors if recheck else [])
+                    notes.append("LLM plan rejected by request-scope validation: " + "; ".join(reasons[:3]))
+                    corrections.append(
+                        Correction(
+                            "rejected",
+                            "The LLM plan was replaced by the deterministic plan: " + "; ".join(reasons[:2]),
+                        )
+                    )
+                elif recheck is not None:
+                    chosen, source = recheck.plan, "llm"
             except LLMUnavailableError as exc:
                 notes.append(str(exc))
                 if not settings.llm_fallback_to_rules:
@@ -335,7 +467,8 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
                         "trace": _trace(state, "plan", "LLM unavailable", str(exc), "error"),
                     }
             except LLMError as exc:
-                notes.append(f"LLM planning failed: {str(exc)[:200]}")
+                if str(exc) != "invalid plan":
+                    notes.append(f"LLM planning failed: {str(exc)[:200]}")
             for call in rt.llm.calls[-3:]:
                 rt.audit.log(
                     "llm_call",
@@ -348,31 +481,52 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
                     attempts=call.attempts,
                     error=call.error,
                 )
-        try:
-            p_rules, intent = rules.plan(state["effective_question"], prev_intent)
-        except Exception as exc:  # pragma: no cover - defensive
-            log.exception("Rule planner failed")
-            p_rules, intent = Plan(interpretation="", steps=[], clarification=f"Planner error: {exc}"), None
         if chosen is None:
-            check = validate_plan(
-                p_rules, rt.tools, rt.registry, rt.mode, rt.store, turn, settings.max_plan_steps, ctx
-            )
-            chosen = check.plan
+            check = structural(p_rules)
+            sem = validator.check(check.plan, scope, "rules")  # consistency check of the rule plan
+            corrections += [c for c in sem.corrections if c.kind != "rejected"]
+            chosen = sem.plan if not sem.rejected else check.plan
             source = "rules" if rt.llm is None else "rules_fallback"
             if check.errors and not chosen.clarification:
                 notes += check.errors
+        for n in intent.notes if intent else []:
+            if n.startswith(
+                ("No year given", "'", "Kept the date range", "Removed the previous date", "Used the year")
+            ):
+                corrections.append(Correction("assumption", n, None, "dates"))
+        validation = [c.to_dict() for c in corrections]
         detail = {
             "source": source,
             "interpretation": chosen.interpretation,
             "steps": [f"{s.id} {s.tool}: {s.purpose}" for s in chosen.steps],
             "assumptions": chosen.assumptions,
             "notes": notes,
+            "request_scope": {
+                "period": scope.period_text(),
+                "boroughs": scope.boroughs,
+                "categories": scope.subject_categories,
+                "areas": [str(a.get("name")) for a in scope.areas] + scope.zips,
+            },
         }
         title = {
             "llm": f"Plan written by {rt.llm.label if rt.llm else 'LLM'}",
             "rules": "Plan from deterministic planner",
             "rules_fallback": "LLM unavailable or invalid; used deterministic planner",
         }[source]
+        if source == "rules_fallback" and any(c.kind == "rejected" for c in corrections):
+            title = "LLM plan was outside the request scope; used deterministic planner"
+        trace.append({"node": "plan", "title": title, "kind": "plan", "detail": detail, "ts": time.time()})
+        fixes = [c for c in corrections if c.kind in ("removed", "changed", "added", "rejected")]
+        if fixes:
+            trace.append(
+                {
+                    "node": "plan",
+                    "title": f"Plan checked against the question: {len(fixes)} correction(s)",
+                    "kind": "warning",
+                    "detail": [f"{c.step + ': ' if c.step else ''}{c.message}" for c in fixes],
+                    "ts": time.time(),
+                }
+            )
         status = "clarification" if chosen.clarification else "running"
         rt.audit.log(
             "plan",
@@ -381,24 +535,59 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
             source=source,
             interpretation=chosen.interpretation,
             steps=[{"id": s.id, "tool": s.tool} for s in chosen.steps],
+            corrections=[c.message for c in fixes],
         )
         return {
             "plan": chosen.model_dump(),
             "plan_source": source,
             "intent": intent.to_dict() if intent else None,
+            "scope": scope.to_dict(),
+            "validation": validation,
             "status": status,
             "replan_feedback": None,
             "llm_used": source == "llm",
-            "trace": [
-                *trace,
-                {"node": "plan", "title": title, "kind": "plan", "detail": detail, "ts": time.time()},
-            ],
+            "trace": trace,
         }
+
+    # ---- coverage ------------------------------------------------------------------------------
+    def check_coverage(state: AgentState) -> dict[str, Any]:
+        turn = state["turn"]
+        ctx = rt.tool_context(turn)
+        p = Plan.model_validate(state["plan"])
+        scope = QuestionScope.from_dict(state.get("scope") or {"question": state["question"]})
+        data_scope = build_data_scope(
+            rt, ctx, p, scope, state.get("plan_source", ""), state.get("validation", [])
+        )
+        update: dict[str, Any] = {"data_scope": data_scope}
+        kind = "info"
+        if data_scope["status"] == "insufficient_coverage":
+            update["status"] = "insufficient_coverage"
+            kind = "warning"
+            title = "The stored data does not cover the requested period; nothing was run"
+        elif data_scope["warnings"]:
+            kind = "warning"
+            title = "Data coverage checked: " + data_scope["warnings"][0][:120]
+        else:
+            title = "Data coverage checked"
+        update["trace"] = _trace(
+            state,
+            "check_coverage",
+            title,
+            {
+                "datasets": [d.get("summary") for d in data_scope["datasets"]],
+                "warnings": data_scope["warnings"],
+            },
+            kind,
+        )
+        return update
+
+    def route_after_coverage(state: AgentState) -> str:
+        return "respond" if state.get("status") == "insufficient_coverage" else "review_sql"
 
     # ---- review SQL --------------------------------------------------------------------------
     def review_sql(state: AgentState) -> dict[str, Any]:
         turn = state["turn"]
-        ctx = rt.tool_context(turn)
+        ctx = rt.tool_context(turn, scope=state.get("scope"))
         p = Plan.model_validate(state["plan"])
         reviews = []
         for step in p.steps:
@@ -535,30 +724,59 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
     # ---- execute ---------------------------------------------------------------------------------
     def execute(state: AgentState) -> dict[str, Any]:
         turn = state["turn"]
-        ctx = rt.tool_context(turn)
+        ctx = rt.tool_context(turn, scope=state.get("scope"))
         p = Plan.model_validate(state["plan"])
         blocked = {r["step_id"]: r for r in state.get("sql_reviews", []) if not r["ok"]}
         step_ids = {s.id for s in p.steps}
-        failed: set[str] = set()
+        done: dict[str, dict[str, Any]] = {}
         records = []
         trace = list(state.get("trace", []))
         for step in p.steps:
             spec = rt.tools.get(step.tool)
-            deps = [str(step.args[f]) for f in spec.ref_fields if step.args.get(f) in step_ids]
             rec: dict[str, Any] = {
                 "step_id": step.id,
                 "tool": step.tool,
                 "purpose": step.purpose,
                 "args": step.args,
             }
+            skip = None
+            for fname in spec.ref_fields:
+                ref = step.args.get(fname)
+                if not isinstance(ref, str):
+                    continue
+                if ref in step_ids:
+                    dep = done.get(ref)
+                    art = rt.store.get(dep.get("artifact_id") or "") if dep else None
+                    if dep is None or art is None or art.turn != turn:
+                        dep_reason = (dep or {}).get("reason")
+                        if dep_reason in EMPTY_REASONS:
+                            skip = ("empty_input", f"Skipped: {ref} had no records to work with.")
+                        elif dep_reason in FAILURE_REASONS:
+                            skip = (
+                                "dependency_failed",
+                                f"Skipped because {ref} ({(dep or {}).get('tool')}) did not complete.",
+                            )
+                        else:
+                            skip = ("missing_input", f"Skipped: {ref} produced no result to use as input.")
+                        break
+                    if art.rows == 0 and not spec.accepts_empty_input:
+                        skip = (
+                            "empty_input",
+                            f"Skipped: the input from {ref} ('{art.title}') has no records.",
+                        )
+                        break
+                elif ref in ("last", "previous", "prev") or re.fullmatch(r"t\d+\.[sd]\d+", ref):
+                    if rt.store.resolve(ref, turn) is None:
+                        skip = ("missing_input", f"Skipped: there is no result '{ref}' to use as input.")
+                        break
             if step.id in blocked:
                 rec.update(
-                    status="error", summary="Blocked by SQL policy: " + "; ".join(blocked[step.id]["errors"])
+                    status="error",
+                    reason="blocked_by_policy",
+                    summary="Blocked by SQL policy: " + "; ".join(blocked[step.id]["errors"]),
                 )
-            elif any(d in failed for d in deps):
-                rec.update(
-                    status="skipped", summary=f"Skipped because a required step failed ({', '.join(deps)})."
-                )
+            elif skip is not None:
+                rec.update(status="skipped", reason=skip[0], summary=skip[1])
             else:
                 ctx.step_id = step.id
                 out = rt.tools.invoke(step.tool, step.args, ctx)
@@ -571,8 +789,7 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
                     "get_schema",
                 ):
                     rec["data"] = out.data
-            if rec["status"] in ("error", "skipped", "needs_approval", "unavailable"):
-                failed.add(step.id)
+            done[step.id] = rec
             records.append(rec)
             trace.append(
                 {
@@ -583,6 +800,7 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
                         k: rec.get(k)
                         for k in (
                             "status",
+                            "reason",
                             "summary",
                             "highlights",
                             "rows",
@@ -601,7 +819,12 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
 
     # ---- reflect -------------------------------------------------------------------------------
     def reflect(state: AgentState) -> dict[str, Any]:
-        errors = [s for s in state.get("steps", []) if s["status"] == "error"]
+        steps = state.get("steps", [])
+        # Replan only for genuine execution errors (not for empty results or steps skipped because
+        # an input was empty or missing): a new plan cannot create data that is not there.
+        errors = [
+            s for s in steps if s.get("reason") == "error" or (s["status"] == "error" and not s.get("reason"))
+        ]
         if errors and state.get("plan_source") == "llm" and state.get("replans", 0) < settings.max_replans:
             fb = [f"{s['step_id']} {s['tool']}: {s['summary']}" for s in errors]
             return {
@@ -611,12 +834,17 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
                     state, "reflect", "Some steps failed; asking the planner to revise", fb, "warning"
                 ),
             }
-        empties = [s for s in state.get("steps", []) if s["status"] == "empty"]
-        detail = None
-        if empties:
-            detail = [f"{s['step_id']} returned no rows" for s in empties]
-        title = "Results checked" + (f" ({len(errors)} step errors)" if errors else "")
-        return {"trace": _trace(state, "reflect", title, detail, "warning" if errors or empties else "info")}
+        detail = []
+        for s in steps:
+            if s.get("reason") in EMPTY_REASONS or s.get("status") == "skipped":
+                detail.append(f"{s['step_id']} {s['tool']}: {s.get('reason')} — {s.get('summary', '')}")
+        failed = [s for s in steps if s.get("reason") in FAILURE_REASONS]
+        title = "Results checked" + (f" ({len(failed)} step(s) did not complete)" if failed else "")
+        return {
+            "trace": _trace(
+                state, "reflect", title, detail or None, "warning" if detail or failed else "info"
+            )
+        }
 
     def route_after_reflect(state: AgentState) -> str:
         return "plan" if state.get("replan_feedback") else "finalize"
@@ -660,7 +888,27 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
             f"SQL is validated by an AST-based read-only guard (allowlisted tables, row limit "
             f"{settings.max_result_rows:,}, timeout {settings.query_timeout_s}s)."
         )
+        data_scope = dict(state.get("data_scope") or {})
+        if data_scope:
+            by_id = {s["step_id"]: s for s in steps}
+            entries = []
+            for e in data_scope.get("datasets", []):
+                e = dict(e)
+                rec = by_id.get(e["step"])
+                if rec is not None:
+                    e["matching_rows"] = rec.get("rows")
+                    e["truncated"] = bool((rec.get("facts") or {}).get("truncated"))
+                    after = [
+                        by_id[s.id].get("rows")
+                        for s in Plan.model_validate(state["plan"]).steps
+                        if s.tool == "filter_by_area" and s.args.get("input") == e["step"] and s.id in by_id
+                    ]
+                    if after:
+                        e["rows_in_areas"] = after[0]
+                entries.append(e)
+            data_scope["datasets"] = entries
         return {
+            "data_scope": data_scope or None,
             "layers": layers,
             "primary_artifact": primary.id if primary else None,
             "citations": citations_for(datasets),
@@ -680,7 +928,9 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
             rt, [c["dataset_id"] for c in state.get("citations", [])] + p.get("datasets", [])
         )
         intent = state.get("intent") or {}
+        data_scope = state.get("data_scope")
         adjustments: list[str] = []
+        narrative_rejected: list[str] = []
         narrator = "template"
         if status == "clarification":
             answer = Answer(
@@ -711,6 +961,12 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
                 limitations=[],
                 suggested_follow_ups=[],
             )
+        elif status == "insufficient_coverage":
+            answer = coverage_answer(data_scope or {})
+            context.pop("pending_clarification", None)
+            context["last_question"] = state["question"]
+            context["last_interpretation"] = p.get("interpretation")
+            context["last_intent"] = intent or None
         else:
             steps = state.get("steps", [])
             answer = template_answer(
@@ -720,19 +976,57 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
                 intent.get("analysis"),
                 datasets,
                 state.get("primary_artifact"),
+                data_scope,
             )
-            if rt.llm is not None and rt.policy.may_include_results(datasets) and steps:
+            template = answer
+            sel = main_selection(steps, {d.id for d in datasets if d.role == "events"})
+            narrate = bool(
+                rt.llm is not None
+                and settings.llm_narration
+                and rt.policy.may_include_results(datasets)
+                and steps
+            )
+            if narrate and (sel is not None and not sel.get("rows")):
+                narrate = False
+                adjustments.append(
+                    "No matching records, so the deterministic summary was used (no LLM narration)."
+                )
+            elif narrate and not any(s["status"] == "ok" for s in steps):
+                narrate = False
+            if narrate and rt.llm is not None:
                 try:
                     user = NARRATOR_USER.format(
                         question=state["question"],
                         interpretation=p.get("interpretation", ""),
                         synthetic=any(d.synthetic for d in datasets),
                         verification=[d.id for d in datasets if d.verification_source] or "none",
+                        scope=wrap_untrusted("data_scope", _scope_digest(data_scope)),
                         results=wrap_untrusted("step_results", [step_digest_for_llm(s) for s in steps]),
                         datasets=wrap_untrusted("datasets", datasets_for_llm(datasets)),
                     )
-                    answer = rt.llm.generate_json(NARRATOR_SYSTEM, user, Answer, purpose="narrate")
-                    narrator = rt.llm.label
+                    candidate = rt.llm.generate_json(NARRATOR_SYSTEM, user, Answer, purpose="narrate")
+                    ev = build_evidence(
+                        state["question"],
+                        p.get("interpretation", ""),
+                        steps,
+                        data_scope,
+                        template,
+                        extra_numbers=[float(n) for d in datasets for n in re.findall(r"\d+", d.label)],
+                    )
+                    if sel is not None:
+                        ev.records = int(sel.get("rows") or 0)
+                    places = [*rt.vocabulary.areas, *rt.vocabulary.streets]
+                    problems = check_narrative(candidate, ev, places)
+                    if problems:
+                        adjustments.append(
+                            "The LLM answer was not used because it "
+                            + "; ".join(problems[:3])
+                            + ". Showing the deterministic summary computed from the results."
+                        )
+                        narrative_rejected = problems
+                        rt.audit.log("narrative_rejected", rt.session_id, turn=turn, problems=problems)
+                    else:
+                        answer, narrator = candidate, rt.llm.label
                 except LLMError as exc:
                     adjustments.append(
                         f"LLM narration unavailable ({str(exc)[:120]}); used template summary."
@@ -753,24 +1047,46 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
             headline=answer.headline[:200],
             adjustments=adjustments,
         )
-        final_status = status if status in ("clarification", "rejected", "error") else "complete"
+        final_status = (
+            status
+            if status in ("clarification", "rejected", "error", "insufficient_coverage")
+            else "complete"
+        )
         content = f"**{answer.headline}**\n\n{answer.summary}"
+        trace = _trace(state, "respond", f"Answer written ({narrator})", adjustments or None)
+        if narrative_rejected:
+            trace.insert(
+                len(trace) - 1,
+                {
+                    "node": "respond",
+                    "title": "LLM answer rejected: it contradicted the computed results",
+                    "kind": "warning",
+                    "detail": narrative_rejected,
+                    "ts": time.time(),
+                },
+            )
         return {
-            "answer": {**answer.model_dump(), "narrator": narrator, "adjustments": adjustments},
+            "answer": {
+                **answer.model_dump(),
+                "narrator": narrator,
+                "adjustments": adjustments,
+                "narrative_rejected": narrative_rejected,
+            },
             "status": final_status,
             "context": context,
             "messages": [{"role": "assistant", "content": content, "turn": turn}],
-            "trace": _trace(state, "respond", f"Answer written ({narrator})", adjustments or None),
+            "trace": trace,
         }
 
     def route_after_plan(state: AgentState) -> str:
-        return "respond" if state.get("status") in ("clarification", "error") else "review_sql"
+        return "respond" if state.get("status") in ("clarification", "error") else "check_coverage"
 
     g = StateGraph(AgentState)
     for name, fn in [
         ("start", start),
         ("discover", discover),
         ("plan", plan),
+        ("check_coverage", check_coverage),
         ("review_sql", review_sql),
         ("approve", approve),
         ("execute", execute),
@@ -782,7 +1098,12 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
     g.add_edge(START, "start")
     g.add_edge("start", "discover")
     g.add_edge("discover", "plan")
-    g.add_conditional_edges("plan", route_after_plan, {"respond": "respond", "review_sql": "review_sql"})
+    g.add_conditional_edges(
+        "plan", route_after_plan, {"respond": "respond", "check_coverage": "check_coverage"}
+    )
+    g.add_conditional_edges(
+        "check_coverage", route_after_coverage, {"respond": "respond", "review_sql": "review_sql"}
+    )
     g.add_conditional_edges(
         "review_sql", route_after_review, {"plan": "plan", "approve": "approve", "execute": "execute"}
     )
@@ -792,6 +1113,27 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
     g.add_edge("finalize", "respond")
     g.add_edge("respond", END)
     return g.compile(checkpointer=checkpointer or InMemorySaver())
+
+
+def _scope_digest(data_scope: dict[str, Any] | None) -> dict[str, Any]:
+    if not data_scope:
+        return {}
+    return {
+        "period_requested": data_scope.get("period"),
+        "datasets": [
+            {
+                "dataset": d.get("name"),
+                "requested": d.get("requested_text"),
+                "matching_records": d.get("matching_rows"),
+                "stored_records": (d.get("coverage") or {}).get("rows"),
+                "stored_from": (d.get("coverage") or {}).get("date_min"),
+                "stored_to": (d.get("coverage") or {}).get("date_max"),
+                "incomplete_copy": (d.get("coverage") or {}).get("limit_reached"),
+            }
+            for d in data_scope.get("datasets", [])
+        ],
+        "warnings": data_scope.get("warnings", []),
+    }
 
 
 # =========================================================================================
@@ -813,12 +1155,17 @@ class TurnResult:
     primary_artifact: str | None
     pending_approval: dict[str, Any] | None = None
     elapsed_s: float = 0.0
+    validation: list[dict[str, Any]] = field(default_factory=list)
+    data_scope: dict[str, Any] | None = None
 
 
 PER_TURN_RESET: dict[str, Any] = {
     "plan": None,
     "plan_source": "",
     "intent": None,
+    "scope": None,
+    "validation": [],
+    "data_scope": None,
     "sql_reviews": [],
     "approval": None,
     "steps": [],
@@ -875,6 +1222,8 @@ class AgentSession:
             primary_artifact=vals.get("primary_artifact"),
             pending_approval=pending,
             elapsed_s=round(time.perf_counter() - t0, 2),
+            validation=vals.get("validation") or [],
+            data_scope=vals.get("data_scope"),
         )
         if not pending:
             self.history.append(result)

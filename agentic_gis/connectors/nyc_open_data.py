@@ -120,6 +120,9 @@ class IngestResult:
     rows: int
     retrieved: str
     where: str | None
+    limit_reached: bool = False
+    date_min: str | None = None
+    date_max: str | None = None
 
 
 def _coerce_types(df: pd.DataFrame, ds: DatasetSpec) -> pd.DataFrame:
@@ -163,10 +166,12 @@ def ingest_dataset(
         gj = client.query_geojson(sc.dataset_id, where, max_rows)
         gdf = gpd.GeoDataFrame.from_features(gj.get("features", []), crs="EPSG:4326")
         gdf.columns = [str(c).lower() if c != "geometry" else c for c in gdf.columns]
+        fetched = len(gdf)
     else:
         df = client.fetch_all(sc.dataset_id, sc.select, where, sc.order, max_rows)
         if df.empty:
             raise ConnectorError(f"No rows returned for {ds.id} (where: {where})")
+        fetched = len(df)
         df = _coerce_types(df, ds)
         sp = ds.spatial
         lat = (sp.lat_column or "").lower() if sp else ""
@@ -183,13 +188,39 @@ def ingest_dataset(
     path.parent.mkdir(parents=True, exist_ok=True)
     gdf.to_parquet(path, index=False)
     retrieved = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    meta = {
+    meta: dict[str, Any] = {
         "dataset_id": ds.id,
         "socrata_id": sc.dataset_id,
         "domain": client.domain,
         "where": where,
+        "order": sc.order,
+        "limit": max_rows,
+        "fetched_rows": fetched,
+        "limit_reached": fetched >= max_rows,
         "rows": len(gdf),
         "retrieved_utc": retrieved,
     }
+    if ds.temporal and ds.temporal.column in gdf.columns:
+        dates = pd.to_datetime(gdf[ds.temporal.column], errors="coerce").dropna()
+        if len(dates):
+            meta["date_column"] = ds.temporal.column
+            meta["date_min"] = dates.min().date().isoformat()
+            meta["date_max"] = dates.max().date().isoformat()
+    if fetched >= max_rows:
+        log.warning(
+            "%s: the download stopped at the %s-row limit; the stored copy is a subset (order: %s).",
+            ds.id,
+            f"{max_rows:,}",
+            sc.order,
+        )
     path.with_suffix(".provenance.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    return IngestResult(ds.id, path, len(gdf), retrieved, where)
+    return IngestResult(
+        ds.id,
+        path,
+        len(gdf),
+        retrieved,
+        where,
+        limit_reached=bool(meta["limit_reached"]),
+        date_min=meta.get("date_min"),
+        date_max=meta.get("date_max"),
+    )

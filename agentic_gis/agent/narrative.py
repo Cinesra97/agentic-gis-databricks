@@ -12,6 +12,10 @@ SYNTHETIC_NOTICE = (
     "Results are computed from SYNTHETIC demonstration data generated for this app; they are not "
     "findings about New York City."
 )
+EMPTY_NOTICE = (
+    "Zero matching records means none are in this dataset for these filters; it is not evidence that no "
+    "incidents occurred."
+)
 REPORTS_NOTICE = (
     "Complaint (311) records are reports from the public. They indicate where conditions were "
     "reported, not where violations were verified."
@@ -102,6 +106,50 @@ def enforce_guardrails(answer: Answer, datasets: list[DatasetSpec]) -> tuple[Ans
 
 
 PREFERRED_KEY_TOOL = {"temporal": "analyze_temporal_patterns", "change": "compare_periods"}
+_FAILURE_REASONS = {
+    "error",
+    "blocked_by_policy",
+    "needs_approval",
+    "unavailable",
+    "dependency_failed",
+    "missing_input",
+}
+
+
+def main_selection(steps: list[dict[str, Any]], events: set[str] | None = None) -> dict[str, Any] | None:
+    """The step that selected the records being analyzed (first events filter, else first selection)."""
+    sel = [s for s in steps if s.get("tool") in ("filter_dataset", "query_local_data", "query_databricks")]
+    if events:
+        for s in sel:
+            facts = s.get("facts") or {}
+            ids = {facts.get("dataset"), *(facts.get("datasets") or [])} | {
+                (s.get("args") or {}).get("dataset")
+            }
+            if ids & events:
+                return s
+    return sel[0] if sel else None
+
+
+def describe_filters(facts: dict[str, Any]) -> str:
+    bits = []
+    if facts.get("categories"):
+        bits.append("categories " + ", ".join(map(str, facts["categories"])))
+    if facts.get("boroughs"):
+        bits.append("boroughs " + ", ".join(map(str, facts["boroughs"])))
+    if facts.get("date_from") or facts.get("date_to"):
+        bits.append(f"dates {facts.get('date_from') or '…'} to {facts.get('date_to') or '…'}")
+    for f in facts.get("filters") or []:
+        bits.append(f"{f.get('column')} {f.get('op')} {f.get('value')}")
+    return "; ".join(bits) or "no filters"
+
+
+def _skip_text(s: dict[str, Any]) -> str:
+    reason = s.get("reason")
+    if reason == "empty_input":
+        return f"Step {s['step_id']} ({s['tool']}) was skipped because its input had no records."
+    if reason in ("dependency_failed", "missing_input"):
+        return f"Step {s['step_id']} ({s['tool']}) was skipped because an earlier step produced no result."
+    return f"Step {s['step_id']} ({s['tool']}) did not complete: {s.get('summary', '')}"
 
 
 def template_answer(
@@ -111,10 +159,48 @@ def template_answer(
     analysis: str | None,
     datasets: list[DatasetSpec],
     primary_artifact: str | None = None,
+    data_scope: dict[str, Any] | None = None,
 ) -> Answer:
     """Deterministic narrative from tool outputs (used in demo mode and as LLM fallback)."""
     ok = [s for s in steps if s.get("status") in ("ok", "empty")]
-    failed = [s for s in steps if s.get("status") in ("error", "needs_approval", "skipped", "unavailable")]
+    failed = [
+        s
+        for s in steps
+        if s.get("status") in ("error", "needs_approval", "unavailable")
+        or (s.get("status") == "skipped" and s.get("reason") in _FAILURE_REASONS)
+    ]
+    skipped_empty = [s for s in steps if s.get("status") == "skipped" and s.get("reason") == "empty_input"]
+    scope_warnings = list((data_scope or {}).get("warnings", []))
+    sel = main_selection(steps, {d.id for d in datasets if d.role == "events"})
+    if sel is not None and sel.get("status") == "empty" and not sel.get("rows"):
+        facts = sel.get("facts") or {}
+        cov = next(
+            (
+                d.get("coverage")
+                for d in (data_scope or {}).get("datasets", [])
+                if d.get("step") == sel["step_id"]
+            ),
+            None,
+        )
+        where = f" {cov['description']}." if cov and cov.get("description") else ""
+        ds_id = facts.get("dataset") or ", ".join(facts.get("datasets") or []) or "the dataset"
+        return Answer(
+            headline="No matching records in the available data",
+            summary=(
+                f"The selection from {ds_id} returned 0 records ({describe_filters(facts)}). The data in this app "
+                f"covers:{where or ' (coverage not measured).'} {EMPTY_NOTICE}"
+                + (" Later steps were skipped because they had no input." if skipped_empty else "")
+            ),
+            findings=[
+                Finding(kind="observation", text=f"0 records matched in {ds_id} ({describe_filters(facts)}).")
+            ],
+            limitations=[*scope_warnings, EMPTY_NOTICE, *(_skip_text(s) for s in failed)][:6],
+            suggested_follow_ups=[
+                "Use all available dates",
+                "Show this citywide",
+                "Which complaint types are most common?",
+            ],
+        )
     analytic = [
         s
         for s in ok
@@ -140,7 +226,10 @@ def template_answer(
         )
     if key is None:
         headline = "The analysis could not be completed."
-        summary = "No step produced results. " + " ".join(s.get("summary", "") for s in failed[:2])
+        root = [s for s in failed if s.get("reason") not in ("dependency_failed", "missing_input")] or failed
+        summary = "No step produced results. " + " ".join(
+            f"Step {s['step_id']} ({s['tool']}) failed: {s.get('summary', '')}" for s in root[:2]
+        )
     else:
         headline = key.get("headline") or key.get("summary", interpretation)
         lead = (
@@ -161,6 +250,16 @@ def template_answer(
     for s in ordered:
         for h in s.get("highlights", [])[:3]:
             findings.append(Finding(kind="observation", text=h))
+    if key is not None and key.get("reason") == "zero_clusters":
+        n_in = (key.get("facts") or {}).get("input_rows")
+        findings.append(
+            Finding(
+                kind="observation",
+                text=f"No clusters were found, but {n_in:,} reports were analyzed: zero clusters is not zero complaints."
+                if n_in
+                else "No clusters were found; this is not the same as zero complaints.",
+            )
+        )
     if analysis in ("repeat", "hotspot") and findings:
         findings.append(
             Finding(
@@ -190,12 +289,12 @@ def template_answer(
                 ),
             )
         )
-    limitations: list[str] = []
+    limitations: list[str] = list(scope_warnings)
     for s in steps:
         for w in s.get("warnings", []):
             limitations.append(w)
-    for s in failed:
-        limitations.append(f"Step {s['step_id']} ({s['tool']}) did not complete: {s.get('summary', '')}")
+    for s in failed + skipped_empty:
+        limitations.append(_skip_text(s))
     follow = _follow_ups(analysis)
     return Answer(
         headline=headline,
@@ -203,6 +302,41 @@ def template_answer(
         findings=findings[:8],
         limitations=limitations[:6],
         suggested_follow_ups=follow,
+    )
+
+
+def coverage_answer(data_scope: dict[str, Any]) -> Answer:
+    """Answer for a request whose period is entirely outside the stored data (nothing was run)."""
+    entry = next((d for d in data_scope.get("datasets", []) if d.get("overlap") == "none"), None) or {}
+    cov = entry.get("coverage") or {}
+    requested = entry.get("requested_text") or data_scope.get("period") or "the requested period"
+    rows = cov.get("rows")
+    stored = (
+        f"{rows:,} records dated {cov.get('date_min')} to {cov.get('date_max')}"
+        if rows is not None and cov.get("date_min")
+        else "records outside that period"
+    )
+    limitations = [f"{entry.get('name', 'Dataset')}: {n}" for n in cov.get("notes") or []]
+    if (
+        cov.get("source", "")
+        and str(cov.get("source")).startswith("NYC Open Data")
+        and entry.get("requested_from")
+    ):
+        limitations.append(
+            f"To analyze that period, ingest it first, e.g. `agentic-gis ingest {entry.get('dataset')} "
+            f"--since {entry.get('requested_from')}` (check the row limit), then restart the app."
+        )
+    return Answer(
+        headline=f"The available data does not cover {requested}",
+        summary=(
+            f"You asked about {requested}. {entry.get('name', 'The dataset')} in this app contains {stored}. "
+            "No analysis was run: an empty result would only mean that the period is missing from the stored "
+            "data, not that there were no complaints."
+        ),
+        findings=[],
+        limitations=limitations[:5],
+        suggested_follow_ups=["Use all available dates"]
+        + ([f"Show {cov.get('date_min')} to {cov.get('date_max')}"] if cov.get("date_min") else []),
     )
 
 
@@ -251,20 +385,21 @@ def step_digest_for_llm(step: dict[str, Any]) -> dict[str, Any]:
             "summary",
             "highlights",
             "rows",
+            "reason",
+            "facts",
             "notes",
             "warnings",
         )
-        if step.get(k) not in (None, [], "")
+        if step.get(k) not in (None, [], "", {})
     }
 
 
 def datasets_for_llm(datasets: list[DatasetSpec]) -> list[dict[str, Any]]:
     return [
-        {
+        {  # names only: titles/publishers can contain years that are not the analyzed period
             "id": d.id,
-            "name": d.name,
+            "name": d.label,
             "synthetic": d.synthetic,
-            "publisher": d.provenance.publisher,
             "verification_source": d.verification_source,
         }
         for d in datasets

@@ -63,6 +63,11 @@ class Settings(BaseSettings):
         True,
         description="Use the deterministic planner when the LLM is unavailable or returns invalid output.",
     )
+    llm_narration: bool = Field(
+        True,
+        description="Let the LLM write the final answer (checked against the results; falls back to the "
+        "deterministic summary). False saves one model call per question.",
+    )
     allow_external_llm: bool = Field(
         False,
         description="Permit LLM endpoints that are not on localhost. Requires explicit organizational approval.",

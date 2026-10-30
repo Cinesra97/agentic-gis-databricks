@@ -29,6 +29,7 @@ from agentic_gis.connectors.base import (
     QueryResult,
     QueryTimeoutError,
 )
+from agentic_gis.connectors.coverage import DatasetCoverage, profile_frame
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +97,7 @@ class LocalDuckDBEngine:
             self.con.execute(f"SET threads = {int(threads)}")
         self.spatial_available, self.spatial_message = self._load_spatial(install_extensions)
         self.tables: dict[str, LoadedTable] = {}
+        self.coverage: dict[str, DatasetCoverage] = {}
         self.load_errors: dict[str, str] = {}
         for ds in registry.available(mode, backend="local"):
             try:
@@ -159,6 +161,10 @@ class LocalDuckDBEngine:
         finally:
             self.con.unregister(tmp)
         self.tables[ds.id] = LoadedTable(ds.id, table, len(plain), geom_col)
+        try:  # measured once from the frame already in memory (no extra file scan)
+            self.coverage[ds.id] = profile_frame(ds, plain)
+        except Exception as exc:  # pragma: no cover - coverage is informational
+            log.warning("Coverage profiling failed for %s: %s", ds.id, exc)
 
     def _lock_down(self) -> None:
         self.con.execute("SET enable_external_access = false")
@@ -238,6 +244,7 @@ class LocalDuckDBEngine:
                 message=f"DuckDB {duckdb.__version__} ready with {len(self.tables)} tables. {self.spatial_message}",
                 details={
                     "tables": {k: v.rows for k, v in self.tables.items()},
+                    "coverage": {k: v.describe() for k, v in self.coverage.items()},
                     "load_errors": self.load_errors,
                 },
             )
