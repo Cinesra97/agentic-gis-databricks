@@ -116,7 +116,7 @@ def test_external_endpoint_blocked_by_default(tmp_path):
 
 def test_llm_plan_with_generated_sql_requires_approval(tmp_path, registry, demo_engine):
     fake = FakeOllama([json.dumps(LLM_PLAN)])
-    session, rt = make_session(tmp_path, registry, demo_engine, fake)
+    session, rt = make_session(tmp_path, registry, demo_engine, fake, llm_narration=True)
     r = session.ask("Where are repeated dumping complaints in Brooklyn?")
     assert r.status == "awaiting_approval" and r.plan_source == "llm"
     q = r.pending_approval["queries"][0]
@@ -176,7 +176,7 @@ def test_narration_guardrails(tmp_path, registry, demo_engine):
         }
     )
     fake = FakeOllama([json.dumps(STRUCTURED_PLAN)], narrator=narr)
-    session, _ = make_session(tmp_path, registry, demo_engine, fake)
+    session, _ = make_session(tmp_path, registry, demo_engine, fake, llm_narration=True)
     r = session.ask("Count derelict vehicles by borough")
     a = r.answer
     assert a["findings"][0]["kind"] == "inference"

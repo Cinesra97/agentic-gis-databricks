@@ -47,7 +47,8 @@ def render_answer(turn: TurnResult) -> None:
                 st.markdown(f"- {item}")
     render_data_scope(turn, compact=True)
     meta = []
-    meta.append(f"narrative: {ans.get('narrator', 'template')}")
+    narration = f" ({ans['narration_s']}s)" if ans.get("narration_s") is not None else ""
+    meta.append(f"narrative: {ans.get('narrator', 'template')}{narration}")
     meta.append(f"{turn.elapsed_s:.1f}s")
     st.caption(" · ".join(meta))
     if ans.get("adjustments"):

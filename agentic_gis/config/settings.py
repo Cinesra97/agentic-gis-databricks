@@ -64,9 +64,13 @@ class Settings(BaseSettings):
         description="Use the deterministic planner when the LLM is unavailable or returns invalid output.",
     )
     llm_narration: bool = Field(
-        True,
-        description="Let the LLM write the final answer (checked against the results; falls back to the "
-        "deterministic summary). False saves one model call per question.",
+        False,
+        description="Let the LLM rewrite the answer after every question (checked against the results; "
+        "falls back to the deterministic summary). Off by default: on CPU it roughly triples the time per "
+        "question. The UI and CLI (--narrate) can still request it for a single answer.",
+    )
+    llm_narration_max_tokens: int = Field(
+        450, ge=64, le=4096, description="Output-token cap for one narration call (limits CPU time)."
     )
     allow_external_llm: bool = Field(
         False,

@@ -144,6 +144,11 @@ def profile_frame(ds: DatasetSpec, df: pd.DataFrame) -> DatasetCoverage:
                 + (" (limit taken from the configuration)" if assumed else "")
                 + f"; {which}."
             )
+        matching = side.get("matching_rows")
+        if isinstance(matching, int) and cov.rows is not None and matching > cov.rows:
+            cov.notes.append(
+                f"Only {cov.rows:,} of the {matching:,} records matching the ingestion filter were downloaded."
+            )
         lower = _lower_bound(cov.ingest_where, cov.date_column)
         if lower and cov.date_min and cov.date_min > lower:
             cov.notes.append(

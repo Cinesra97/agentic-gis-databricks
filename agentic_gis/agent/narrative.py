@@ -317,14 +317,23 @@ def coverage_answer(data_scope: dict[str, Any]) -> Answer:
         else "records outside that period"
     )
     limitations = [f"{entry.get('name', 'Dataset')}: {n}" for n in cov.get("notes") or []]
-    if (
-        cov.get("source", "")
-        and str(cov.get("source")).startswith("NYC Open Data")
-        and entry.get("requested_from")
+    if str(cov.get("source") or "").startswith("NYC Open Data") and (
+        entry.get("requested_from") or entry.get("requested_to")
     ):
+        window = " ".join(
+            x
+            for x in (
+                f"--since {entry['requested_from']}" if entry.get("requested_from") else "",
+                f"--until {entry['requested_to']}" if entry.get("requested_to") else "",
+            )
+            if x
+        )
         limitations.append(
-            f"To analyze that period, ingest it first, e.g. `agentic-gis ingest {entry.get('dataset')} "
-            f"--since {entry.get('requested_from')}` (check the row limit), then restart the app."
+            "To analyze that period, download it as a bounded window, e.g. "
+            f"`agentic-gis ingest {entry.get('dataset')} {window} --limit <at least the matching count>`, "
+            "then restart the app. A start date alone is not enough: downloads are newest-first and stop at "
+            "the row limit, so they keep only the most recent records. The ingest command reports how many "
+            "records match the window. Ingesting replaces the stored copy."
         )
     return Answer(
         headline=f"The available data does not cover {requested}",
@@ -392,6 +401,41 @@ def step_digest_for_llm(step: dict[str, Any]) -> dict[str, Any]:
         )
         if step.get(k) not in (None, [], "", {})
     }
+
+
+_DIGEST_SKIP = {"generate_map_layer", "list_datasets", "describe_dataset", "get_schema"}
+_FACT_SKIP = {"filters", "datasets", "truncated", "largest_location_level"}
+
+
+def narration_digest(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compact step results for the narrator: computed facts only (no args, notes or warnings).
+
+    Smaller prompts make narration faster on CPU; limitations and provenance are not sent because
+    the application writes them deterministically.
+    """
+    out: list[dict[str, Any]] = []
+    for s in steps:
+        if s.get("tool") in _DIGEST_SKIP:
+            continue
+        if s.get("status") not in ("ok", "empty"):
+            out.append({"step_id": s.get("step_id"), "tool": s.get("tool"), "status": s.get("status")})
+            continue
+        facts = {
+            k: (v[:6] if isinstance(v, list) else v)
+            for k, v in (s.get("facts") or {}).items()
+            if k not in _FACT_SKIP and v not in (None, [], "")
+        }
+        item = {
+            "step_id": s.get("step_id"),
+            "tool": s.get("tool"),
+            "rows": s.get("rows"),
+            "headline": s.get("headline"),
+            "summary": s.get("summary"),
+            "highlights": (s.get("highlights") or [])[:4],
+            "facts": facts,
+        }
+        out.append({k: v for k, v in item.items() if v not in (None, [], "", {})})
+    return out
 
 
 def datasets_for_llm(datasets: list[DatasetSpec]) -> list[dict[str, Any]]:

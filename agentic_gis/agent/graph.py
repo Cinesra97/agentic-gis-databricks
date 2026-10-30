@@ -39,16 +39,15 @@ from agentic_gis.agent.llm import LLMClient, LLMError, LLMOutputError, LLMUnavai
 from agentic_gis.agent.narrative import (
     citations_for,
     coverage_answer,
-    datasets_for_llm,
     enforce_guardrails,
     main_selection,
-    step_digest_for_llm,
+    narration_digest,
     template_answer,
 )
 from agentic_gis.agent.planner import RulePlanner, Vocabulary, build_planner_prompt, validate_plan
 from agentic_gis.agent.prompts import NARRATOR_SYSTEM, NARRATOR_USER, PLANNER_SYSTEM
 from agentic_gis.agent.semantics import Correction, QuestionScope, SemanticValidator, sql_datasets
-from agentic_gis.agent.state import AgentState, Answer, Plan
+from agentic_gis.agent.state import AgentState, Answer, Narration, Plan
 from agentic_gis.agent.temporal import describe_window
 from agentic_gis.agent.tools import (
     EMPTY_REASONS,
@@ -347,6 +346,120 @@ def build_data_scope(
         ],
         "assumptions": [v for v in validation if v.get("kind") == "assumption"],
     }
+
+
+@dataclass
+class NarrationOutcome:
+    answer: Answer
+    narrator: str
+    adjustments: list[str]
+    rejected: list[str]
+    elapsed_ms: int = 0
+
+
+def narration_blocker(
+    rt: AgentRuntime, steps: list[dict[str, Any]], datasets: list[DatasetSpec]
+) -> str | None:
+    """Why the LLM may not narrate this result (None = it may)."""
+    if rt.llm is None:
+        return "No LLM is configured; the deterministic summary is used."
+    if not steps or not any(s.get("status") == "ok" for s in steps):
+        return "No step produced results, so the deterministic summary is used (no LLM narration)."
+    if not rt.policy.may_include_results(datasets):
+        return "The data policy does not allow sending these results to the LLM."
+    sel = main_selection(steps, {d.id for d in datasets if d.role == "events"})
+    if sel is not None and not sel.get("rows"):
+        return "No matching records, so the deterministic summary was used (no LLM narration)."
+    return None
+
+
+def narrate_answer(
+    rt: AgentRuntime,
+    turn: int,
+    question: str,
+    interpretation: str,
+    steps: list[dict[str, Any]],
+    data_scope: dict[str, Any] | None,
+    datasets: list[DatasetSpec],
+    template: Answer,
+) -> NarrationOutcome:
+    """Let the LLM rewrite the explanation; keep it only if it agrees with the computed facts.
+
+    The model writes headline, summary and findings only. Limitations, provenance/coverage notes and
+    follow-up suggestions always come from the deterministic template.
+    """
+    assert rt.llm is not None
+    t0 = time.perf_counter()
+    user = NARRATOR_USER.format(
+        question=question,
+        interpretation=interpretation,
+        verification=[d.id for d in datasets if d.verification_source] or "none",
+        results=wrap_untrusted("step_results", narration_digest(steps)),
+    )
+    try:
+        candidate = rt.llm.generate_json(
+            NARRATOR_SYSTEM,
+            user,
+            Narration,
+            purpose="narrate",
+            max_tokens=rt.settings.llm_narration_max_tokens,
+        )
+    except LLMError as exc:
+        return NarrationOutcome(
+            template,
+            "template",
+            [f"LLM narration unavailable ({str(exc)[:120]}); used template summary."],
+            [],
+        )
+    finally:
+        if rt.llm.calls:
+            call = rt.llm.calls[-1]
+            rt.audit.log(
+                "llm_call",
+                rt.session_id,
+                turn=turn,
+                purpose=call.purpose,
+                model=call.model,
+                ok=call.ok,
+                elapsed_ms=call.elapsed_ms,
+                attempts=call.attempts,
+                error=call.error,
+            )
+    elapsed = int((time.perf_counter() - t0) * 1000)
+    ev = build_evidence(
+        question,
+        interpretation,
+        steps,
+        data_scope,
+        template,
+        extra_numbers=[float(n) for d in datasets for n in re.findall(r"\d+", d.label)],
+        synthetic=any(d.synthetic for d in datasets) if datasets else None,
+    )
+    sel = main_selection(steps, {d.id for d in datasets if d.role == "events"})
+    if sel is not None:
+        ev.records = int(sel.get("rows") or 0)
+    problems = check_narrative(candidate, ev, [*rt.vocabulary.areas, *rt.vocabulary.streets])
+    if problems:
+        rt.audit.log("narrative_rejected", rt.session_id, turn=turn, problems=problems)
+        return NarrationOutcome(
+            template,
+            "template",
+            [
+                "The LLM answer was not used because it "
+                + "; ".join(problems[:3])
+                + ". Showing the deterministic summary computed from the results."
+            ],
+            problems,
+            elapsed,
+        )
+    answer = Answer(
+        headline=candidate.headline,
+        summary=candidate.summary,
+        findings=candidate.findings[:4],
+        limitations=template.limitations,  # computed, never model-written
+        suggested_follow_ups=template.suggested_follow_ups,
+    )
+    return NarrationOutcome(answer, rt.llm.label, [], [], elapsed)
 
 
 def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
@@ -980,62 +1093,23 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
                 state.get("primary_artifact"),
                 data_scope,
             )
-            template = answer
-            sel = main_selection(steps, {d.id for d in datasets if d.role == "events"})
-            narrate = bool(
-                rt.llm is not None
-                and settings.llm_narration
-                and rt.policy.may_include_results(datasets)
-                and steps
-            )
-            if narrate and (sel is not None and not sel.get("rows")):
-                narrate = False
-                adjustments.append(
-                    "No matching records, so the deterministic summary was used (no LLM narration)."
+            blocker = narration_blocker(rt, steps, datasets)
+            if settings.llm_narration and blocker is None:
+                outcome = narrate_answer(
+                    rt,
+                    turn,
+                    state["question"],
+                    p.get("interpretation", ""),
+                    steps,
+                    data_scope,
+                    datasets,
+                    answer,
                 )
-            elif narrate and not any(s["status"] == "ok" for s in steps):
-                narrate = False
-            if narrate and rt.llm is not None:
-                try:
-                    user = NARRATOR_USER.format(
-                        question=state["question"],
-                        interpretation=p.get("interpretation", ""),
-                        synthetic=any(d.synthetic for d in datasets),
-                        verification=[d.id for d in datasets if d.verification_source] or "none",
-                        scope=wrap_untrusted("data_scope", _scope_digest(data_scope)),
-                        results=wrap_untrusted("step_results", [step_digest_for_llm(s) for s in steps]),
-                        datasets=wrap_untrusted("datasets", datasets_for_llm(datasets)),
-                    )
-                    candidate = rt.llm.generate_json(NARRATOR_SYSTEM, user, Answer, purpose="narrate")
-                    ev = build_evidence(
-                        state["question"],
-                        p.get("interpretation", ""),
-                        steps,
-                        data_scope,
-                        template,
-                        extra_numbers=[float(n) for d in datasets for n in re.findall(r"\d+", d.label)],
-                    )
-                    if sel is not None:
-                        ev.records = int(sel.get("rows") or 0)
-                    places = [*rt.vocabulary.areas, *rt.vocabulary.streets]
-                    problems = check_narrative(candidate, ev, places)
-                    if problems:
-                        adjustments.append(
-                            "The LLM answer was not used because it "
-                            + "; ".join(problems[:3])
-                            + ". Showing the deterministic summary computed from the results."
-                        )
-                        narrative_rejected = problems
-                        rt.audit.log("narrative_rejected", rt.session_id, turn=turn, problems=problems)
-                    else:
-                        # computed caveats (coverage, failed/skipped steps, row limits) always stay
-                        merged = list(dict.fromkeys([*template.limitations, *candidate.limitations]))
-                        answer = candidate.model_copy(update={"limitations": merged[:8]})
-                        narrator = rt.llm.label
-                except LLMError as exc:
-                    adjustments.append(
-                        f"LLM narration unavailable ({str(exc)[:120]}); used template summary."
-                    )
+                answer, narrator = outcome.answer, outcome.narrator
+                adjustments += outcome.adjustments
+                narrative_rejected = outcome.rejected
+            elif settings.llm_narration and rt.llm is not None and blocker:
+                adjustments.append(blocker)
             context.pop("pending_clarification", None)
             context["last_question"] = state["question"]
             context["last_interpretation"] = p.get("interpretation")
@@ -1120,27 +1194,6 @@ def build_graph(rt: AgentRuntime, checkpointer: Any = None) -> Any:
     return g.compile(checkpointer=checkpointer or InMemorySaver())
 
 
-def _scope_digest(data_scope: dict[str, Any] | None) -> dict[str, Any]:
-    if not data_scope:
-        return {}
-    return {
-        "period_requested": data_scope.get("period"),
-        "datasets": [
-            {
-                "dataset": d.get("name"),
-                "requested": d.get("requested_text"),
-                "matching_records": d.get("matching_rows"),
-                "stored_records": (d.get("coverage") or {}).get("rows"),
-                "stored_from": (d.get("coverage") or {}).get("date_min"),
-                "stored_to": (d.get("coverage") or {}).get("date_max"),
-                "incomplete_copy": (d.get("coverage") or {}).get("limit_reached"),
-            }
-            for d in data_scope.get("datasets", [])
-        ],
-        "warnings": data_scope.get("warnings", []),
-    }
-
-
 # =========================================================================================
 # Session facade (used by the Streamlit UI, CLI and tests)
 # =========================================================================================
@@ -1162,6 +1215,7 @@ class TurnResult:
     elapsed_s: float = 0.0
     validation: list[dict[str, Any]] = field(default_factory=list)
     data_scope: dict[str, Any] | None = None
+    question: str = ""
 
 
 PER_TURN_RESET: dict[str, Any] = {
@@ -1229,6 +1283,7 @@ class AgentSession:
             elapsed_s=round(time.perf_counter() - t0, 2),
             validation=vals.get("validation") or [],
             data_scope=vals.get("data_scope"),
+            question=vals.get("question", ""),
         )
         if not pending:
             self.history.append(result)
@@ -1254,6 +1309,56 @@ class AgentSession:
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> TurnResult:
         return self._run(Command(resume={"approved": approved, "fingerprints": fingerprints}), on_event)
+
+    def narrate(self, result: TurnResult | None = None) -> TurnResult:
+        """Ask the LLM to rewrite a finished answer (on demand; off by default after each question).
+
+        The rewrite is checked against the computed results like automatic narration; if it
+        contradicts them the deterministic answer stays. Updates ``result.answer`` in place.
+        """
+        result = result or (self.history[-1] if self.history else None)
+        if result is None:
+            raise ValueError("There is no answer to rewrite yet.")
+        ans = dict(result.answer or {})
+        if result.status != "complete" or ans.get("narrator", "template") != "template":
+            return result
+        rt = self.runtime
+        plan = result.plan or {}
+        datasets = _datasets_used(rt, [c["dataset_id"] for c in result.citations] + plan.get("datasets", []))
+        blocker = narration_blocker(rt, result.steps, datasets)
+        if blocker:
+            result.answer = {**ans, "adjustments": [*ans.get("adjustments", []), blocker]}
+            return result
+        template = Answer.model_validate({k: ans[k] for k in Answer.model_fields if k in ans})
+        outcome = narrate_answer(
+            rt,
+            result.turn,
+            result.question,
+            plan.get("interpretation", ""),
+            result.steps,
+            result.data_scope,
+            datasets,
+            template,
+        )
+        answer, guard = enforce_guardrails(outcome.answer, datasets)
+        result.answer = {
+            **answer.model_dump(),
+            "narrator": outcome.narrator,
+            "adjustments": list(dict.fromkeys([*ans.get("adjustments", []), *outcome.adjustments, *guard])),
+            "narrative_rejected": outcome.rejected,
+            "narration_s": round(outcome.elapsed_ms / 1000, 1),
+        }
+        rt.audit.log(
+            "answer",
+            rt.session_id,
+            turn=result.turn,
+            status=result.status,
+            narrator=outcome.narrator,
+            on_demand=True,
+            headline=answer.headline[:200],
+            adjustments=result.answer["adjustments"],
+        )
+        return result
 
     @property
     def pending_approval(self) -> dict[str, Any] | None:

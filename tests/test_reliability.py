@@ -500,7 +500,7 @@ def test_10_contradictory_narrative_falls_back_to_template(tmp_path, env):
         ["Zero complaints were recorded."],
     )
     fake = FakeOllama([INVENTED], narrator=wrong)
-    s, _ = session(tmp_path, env, fake)
+    s, _ = session(tmp_path, env, fake, llm_narration=True)
     r = s.ask(QUESTION)
     a = r.answer
     assert a["narrator"] == "template" and a["narrative_rejected"]
@@ -519,14 +519,15 @@ def test_10_consistent_narrative_is_kept(tmp_path, env):
         ["The largest cluster has 22 reports."],
     )
     fake = FakeOllama([INVENTED], narrator=good)
-    s, _ = session(tmp_path, env, fake)
+    s, _ = session(tmp_path, env, fake, llm_narration=True)
     r = s.ask(QUESTION)
     assert r.answer["narrator"].startswith("ollama:") and not r.answer["narrative_rejected"]
     prompt = next(
         x for x in fake.requests if not x["messages"][0]["content"].startswith("You are the planning")
     )
     body = prompt["messages"][1]["content"]
-    assert "2026-05-15" in body and "2010" not in body, "narrator sees stored coverage, not publisher years"
+    # the narrator only sees computed step facts: no publisher text ("2010 to Present"), no provenance
+    assert "2010" not in body and "Synthetic data used" not in body and "publisher" not in body.lower()
 
 
 def test_grounding_checks_numbers_years_places_and_absence():

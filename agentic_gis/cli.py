@@ -93,8 +93,14 @@ def cmd_ask(args: argparse.Namespace) -> int:
                 print("\nNot approved. Re-run with --approve to execute.", file=sys.stderr)
                 return 2
             res = session.resume(True, on_event=progress)
+        if args.narrate and res.status == "complete":
+            res = session.narrate(res)
         ans = res.answer or {}
-        print(f"\n[{res.status}] plan source: {res.plan_source} · {res.elapsed_s}s")
+        narr = ans.get("narrator", "template")
+        extra = f" · narration {ans['narration_s']}s" if ans.get("narration_s") is not None else ""
+        print(
+            f"\n[{res.status}] plan source: {res.plan_source} · narrative: {narr} · {res.elapsed_s}s{extra}"
+        )
         scope = res.data_scope or {}
         if scope:
             print(f"[data scope] period: {scope.get('period')}")
@@ -172,14 +178,19 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     ds = reg.get_any(args.dataset)
     token = s.socrata_app_token.get_secret_value() if s.socrata_app_token else None
     client = SocrataClient(s.socrata_domain, token)
-    res = ingest_dataset(ds, client, since=args.since, limit=args.limit)
+    res = ingest_dataset(ds, client, since=args.since, limit=args.limit, until=args.until)
     print(f"Ingested {res.rows:,} rows into {res.path} (where: {res.where})")
+    if res.matching_rows is not None:
+        print(f"Records matching the filter on the portal: {res.matching_rows:,} (limit {res.limit:,})")
     if res.date_min:
         print(f"Stored dates: {res.date_min} to {res.date_max}")
     if res.limit_reached:
         print(
-            "WARNING: the download stopped at the row limit, so the stored copy is a subset "
-            "(see 'order' in config/datasets.yaml). Use --since/--limit to choose the period you need.",
+            "WARNING: the download stopped at the row limit, so the stored copy is incomplete. Downloads are "
+            "ordered newest-first, so only the most recent matching records were kept. To store a historical "
+            "period completely, download a bounded window with both --since and --until and a --limit at least "
+            "as large as the matching count (or split a long period into smaller windows). Ingesting replaces "
+            "the stored copy.",
             file=sys.stderr,
         )
     print("Restart the app (or click 'New conversation') to load the data in 'local' mode.")
@@ -237,6 +248,11 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--model")
     a.add_argument("--approve", action="store_true", help="Approve generated SQL without prompting")
     a.add_argument("--export", help="Directory for CSV/GeoJSON exports")
+    a.add_argument(
+        "--narrate",
+        action="store_true",
+        help="Also let the LLM rewrite the answer (one extra model call; checked against the results)",
+    )
     a.add_argument("-v", "--verbose", action="store_true")
     a.set_defaults(func=cmd_ask)
     d = sub.add_parser("datasets", help="List registered datasets")
@@ -245,6 +261,11 @@ def build_parser() -> argparse.ArgumentParser:
     i = sub.add_parser("ingest", help="Download a public dataset from NYC Open Data")
     i.add_argument("dataset", nargs="?")
     i.add_argument("--since", help="Start date YYYY-MM-DD (temporal datasets)")
+    i.add_argument(
+        "--until",
+        help="End date YYYY-MM-DD, inclusive. Use with --since for a historical window: downloads are "
+        "newest-first and stop at --limit, so --since alone keeps only the most recent records.",
+    )
     i.add_argument("--limit", type=int)
     i.add_argument("--list", action="store_true")
     i.set_defaults(func=cmd_ingest)

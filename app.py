@@ -279,6 +279,22 @@ with right:
     else:
         with tabs[0]:
             results.render_answer(view)
+            ans = view.answer or {}
+            if (
+                rt.llm is not None
+                and view.status == "complete"
+                and ans.get("narrator", "template") == "template"
+                and not ans.get("narrative_rejected")
+            ):
+                if st.button(
+                    "Rewrite this summary with the LLM",
+                    key=f"narrate-{view.turn}",
+                    help="Optional. One more model call (slow on CPU). The rewrite is checked against the "
+                    "computed results; limitations and data notes stay as computed.",
+                ):
+                    with st.spinner("The LLM is rewriting the summary…"):
+                        session.narrate(view)
+                    st.rerun()
         with tabs[1]:
             results.render_results_table(session, view)
         with tabs[2]:

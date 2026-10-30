@@ -48,6 +48,15 @@ class Answer(BaseModel):
     suggested_follow_ups: list[str] = Field(default_factory=list, max_length=4)
 
 
+class Narration(BaseModel):
+    """What the LLM narrator writes. Limitations, provenance, coverage notes and follow-up
+    suggestions are produced deterministically by the application, not by the model."""
+
+    headline: str = Field(description="One-line answer")
+    summary: str = Field(description="2-4 sentences explaining the computed results in plain language")
+    findings: list[Finding] = Field(default_factory=list, description="Up to 4 labeled findings")
+
+
 class AgentState(TypedDict, total=False):
     session_id: str
     mode: str

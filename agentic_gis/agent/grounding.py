@@ -1,9 +1,12 @@
 """Check an LLM-written answer against the computed results before showing it.
 
 The narrator may only restate facts from the step results, the data scope and the question.
-:func:`check_narrative` looks for numbers, years, place names and "nothing was found" claims
-that the evidence does not support. If it finds any, the graph discards the LLM answer and
-uses the deterministic template answer (and records why in the trace and audit log).
+:func:`check_narrative` looks for numbers, years, place names, "nothing was found" claims, and
+claims about the data itself (real vs synthetic, date coverage, truncated downloads) that the
+evidence, the dataset metadata or the question do not support. If it finds any, the graph discards
+the LLM answer and uses the deterministic template answer (and records why in the trace and audit
+log). Limitations and provenance notes are always produced deterministically; the model only
+rewrites the explanation.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from agentic_gis.agent.state import Answer
+from agentic_gis.agent.state import Answer, Narration
 from agentic_gis.spatial.operations import normalize_name
 
 _BOROUGHS = {
@@ -32,6 +35,33 @@ _NO_RECORDS = re.compile(
     r"|\bthere (?:were|are|was|is) no (?:[\w-]+\s+){0,3}(?:complaints?|reports?|records?|requests?|incidents?)\b",
     re.I,
 )
+# Claims about the data itself. Synthetic status comes from dataset metadata, period coverage from the
+# request scope + stored coverage, truncation from the ingestion record -- never from the model.
+_SYNTHETIC_CLAIM = re.compile(
+    r"\b(?:synthetic|simulated|fictional|fictitious|made[- ]up|dummy data|fake data|demonstration data|"
+    r"demo data|sample data|test data)\b|\bnot (?:real|actual)(?: nyc| new york city)? (?:data|findings|records)\b",
+    re.I,
+)
+_REAL_CLAIM = re.compile(
+    r"(?<!not )(?<!n't )\b(?:real|actual|official|authoritative)\s+(?:nyc\s+|new york city\s+)?"
+    r"(?:311\s+)?(?:data|records|complaints|findings|incidents)\b",
+    re.I,
+)
+_PERIOD_CLAIM = re.compile(
+    r"\b(?:does not|doesn't|did not|didn't|do not|don't|may not|might not|cannot|can't|fails? to|not)\s+"
+    r"(?:fully\s+|completely\s+|entirely\s+)?(?:cover|span|include|reflect)\w*\s+(?:the\s+|all\s+(?:of\s+)?)?"
+    r"(?:full|entire|whole|complete|requested|specified|selected|asked)?\s*(?:time\s+)?"
+    r"(?:period|date range|time range|timeframe|time frame|dates|years?|months?)\b"
+    r"|\bpartial(?:ly)?\s+(?:period|coverage|covered|year|time range|date range)\b"
+    r"|\b(?:only|just)\s+(?:partially|partly)\s+cover\w*"
+    r"|\b(?:requested|specified|selected) (?:time\s+)?(?:period|date range|time range|timeframe)\b",
+    re.I,
+)
+_SUBSET_CLAIM = re.compile(
+    r"\b(?:row limit|record limit|download limit|truncated|incomplete (?:download|copy|dataset|data ?set|data|records)|"
+    r"(?:a |only a )?subset of (?:the )?(?:data|records|dataset|complaints)|partial (?:download|copy|dataset))\b",
+    re.I,
+)
 _NO_CLUSTERS = re.compile(
     r"\bno\s+(?:[\w-]+\s+){0,3}(?:clusters?|hot ?spots?|repeat(?:ed)?(?:[- ]report)? locations?)\b"
     r"|\b(?:zero|0)\s+(?:clusters?|hot ?spots?|locations?)\b",
@@ -46,6 +76,10 @@ class Evidence:
     text: str = ""  # normalized evidence text for place-name checks
     records: int | None = None  # rows of the main record selection
     clusters: int | None = None  # clusters / hot spots found (None when not computed)
+    synthetic: bool | None = None  # from dataset metadata (None = unknown, not checked)
+    period_requested: bool = False  # the question asked for a time period
+    period_partial: bool = False  # ... and the stored data covers it only partly (or not at all)
+    subset: bool = False  # the stored copy is a truncated or filtered subset of the source
 
 
 def _flatten(obj: Any) -> Iterable[str]:
@@ -78,9 +112,18 @@ def build_evidence(
     data_scope: dict[str, Any] | None,
     template: Answer | None = None,
     extra_numbers: Iterable[float] = (),
+    synthetic: bool | None = None,
 ) -> Evidence:
     """Facts the narrator may use. Years come only from results, the scope and the question."""
-    ev = Evidence()
+    ev = Evidence(synthetic=synthetic)
+    for d in (data_scope or {}).get("datasets", []):
+        cov = d.get("coverage") or {}
+        if d.get("requested_from") or d.get("requested_to"):
+            ev.period_requested = True
+            if d.get("overlap") in ("partial", "none"):
+                ev.period_partial = True
+        if cov.get("limit_reached") or cov.get("is_subset"):
+            ev.subset = True
     chunks: list[str] = [question, interpretation]
     for s in steps:
         for k in ("summary", "headline", "highlights", "notes", "warnings", "facts", "rows", "purpose"):
@@ -149,14 +192,37 @@ def _supported(value: float, evidence: set[float], pct: bool) -> bool:
 
 
 def check_narrative(
-    answer: Answer,
+    answer: Answer | Narration,
     ev: Evidence,
     place_names: Iterable[str] = (),
 ) -> list[str]:
-    """Problems with an LLM answer (empty list = consistent with the evidence)."""
+    """Problems with an LLM answer (empty list = consistent with the evidence).
+
+    Every model-written sentence is checked, including limitations when the model supplied any.
+    """
     problems: list[str] = []
-    texts = [answer.headline, answer.summary, *(f.text for f in answer.findings)]
+    texts = [
+        answer.headline,
+        answer.summary,
+        *(f.text for f in answer.findings),
+        *getattr(answer, "limitations", []),
+    ]
     body = "\n".join(texts)
+    if ev.synthetic is False and _SYNTHETIC_CLAIM.search(body):
+        problems.append("describes the data as synthetic or demonstration data, but the datasets are real")
+    if ev.synthetic is True and _REAL_CLAIM.search(body):
+        problems.append("describes synthetic demonstration data as real data")
+    if _PERIOD_CLAIM.search(body) and not ev.period_partial:
+        problems.append(
+            "claims a requested period is not (fully) covered, but "
+            + (
+                "the stored data covers the requested period"
+                if ev.period_requested
+                else "the question did not ask for a period"
+            )
+        )
+    if _SUBSET_CLAIM.search(body) and not ev.subset:
+        problems.append("says the data is a truncated subset, but the ingestion record does not show that")
     for m in _NUM.finditer(body):
         raw = m.group(1)
         value = float(raw.replace(",", "") + (m.group(2) or ""))

@@ -119,7 +119,12 @@ class LLMClient:
     def label(self) -> str:
         return f"{self.provider}:{self.model}"
 
-    def chat(self, messages: list[dict[str, str]], schema: dict[str, Any] | None = None) -> str:
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        schema: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
         raise NotImplementedError
 
     def test_connection(self) -> ConnectionStatus:
@@ -128,14 +133,22 @@ class LLMClient:
     def list_models(self) -> list[str]:
         return []
 
-    def generate_json(self, system: str, user: str, model_cls: type[T], purpose: str, retries: int = 1) -> T:
+    def generate_json(
+        self,
+        system: str,
+        user: str,
+        model_cls: type[T],
+        purpose: str,
+        retries: int = 1,
+        max_tokens: int | None = None,
+    ) -> T:
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         schema = inline_refs(model_cls.model_json_schema())
         t0 = time.perf_counter()
         last_err = ""
         raw = ""
         for attempt in range(retries + 1):
-            raw = self.chat(messages, schema=schema)
+            raw = self.chat(messages, schema=schema, max_tokens=max_tokens)
             try:
                 obj = model_cls.model_validate(extract_json(raw))
                 self.calls.append(
@@ -208,12 +221,20 @@ class OllamaClient(LLMClient):
             f"Ollama is not reachable at {self.base_url}. Start the Ollama app or run `ollama serve`."
         )
 
-    def chat(self, messages: list[dict[str, str]], schema: dict[str, Any] | None = None) -> str:
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        schema: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        options: dict[str, Any] = {"temperature": self.temperature, "num_ctx": self.num_ctx}
+        if max_tokens:
+            options["num_predict"] = int(max_tokens)  # caps generation time on CPU
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": self.temperature, "num_ctx": self.num_ctx},
+            "options": options,
             "keep_alive": "15m",
         }
         if schema is not None:
@@ -289,8 +310,15 @@ class OpenAICompatibleClient(LLMClient):
             transport=transport,
         )
 
-    def chat(self, messages: list[dict[str, str]], schema: dict[str, Any] | None = None) -> str:
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        schema: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
         body: dict[str, Any] = {"model": self.model, "messages": messages, "temperature": self.temperature}
+        if max_tokens:
+            body["max_tokens"] = int(max_tokens)
         if schema is not None:
             body["response_format"] = {
                 "type": "json_schema",
