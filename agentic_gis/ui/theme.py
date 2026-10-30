@@ -14,6 +14,7 @@ NODE_LABELS = {
     "start": "Reading the question",
     "discover": "Searching authorized datasets",
     "plan": "Writing an analysis plan",
+    "check_coverage": "Checking the request against the stored data",
     "review_sql": "Validating SQL against the safety policy",
     "approve": "Waiting for SQL approval",
     "execute": "Running analysis steps",

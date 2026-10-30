@@ -42,6 +42,11 @@ def cmd_check(args: argparse.Namespace) -> int:
     eng = LocalDuckDBEngine(reg, args.mode or s.mode, install_extensions=s.duckdb_install_extensions)
     st = eng.test_connection()
     print(("OK   " if st.ok else "FAIL ") + st.message)
+    for did, cov in eng.coverage.items():
+        flag = "  [SUBSET: row limit reached]" if cov.limit_reached else ""
+        print(f"     {did:<28} {cov.describe()}{flag}")
+        for n in cov.notes:
+            print(f"     {'':<28} note: {n}")
     if eng.load_errors:
         ok = False
         _print(eng.load_errors)
@@ -90,6 +95,22 @@ def cmd_ask(args: argparse.Namespace) -> int:
             res = session.resume(True, on_event=progress)
         ans = res.answer or {}
         print(f"\n[{res.status}] plan source: {res.plan_source} · {res.elapsed_s}s")
+        scope = res.data_scope or {}
+        if scope:
+            print(f"[data scope] period: {scope.get('period')}")
+            for d in scope.get("datasets", []):
+                cov = d.get("coverage") or {}
+                print(
+                    f"  {d.get('name')}: applied {d.get('requested_text')}; matching "
+                    f"{d.get('matching_rows') if d.get('matching_rows') is not None else '—'}; stored "
+                    f"{cov.get('rows', '—')} records {cov.get('date_min') or '?'} to {cov.get('date_max') or '?'}"
+                    + (" (subset: row limit reached)" if cov.get("limit_reached") else "")
+                )
+            for w in scope.get("warnings", []):
+                print(f"  ⚠ {w}")
+        for v in res.validation:
+            if v.get("kind") in ("removed", "changed", "added", "rejected"):
+                print(f"  [corrected] {(v.get('step') or '') + ': ' if v.get('step') else ''}{v['message']}")
         print(f"\n{ans.get('headline', '')}\n\n{ans.get('summary', '')}")
         for f in ans.get("findings", []):
             print(f"  - ({f['kind']}) {f['text']}")
@@ -98,7 +119,10 @@ def cmd_ask(args: argparse.Namespace) -> int:
         if args.verbose:
             print("\nSteps:")
             for st in res.steps:
-                print(f"  {st['step_id']:<4} {st['tool']:<26} {st['status']:<8} {st.get('summary', '')}")
+                print(
+                    f"  {st['step_id']:<4} {st['tool']:<26} {st['status']:<8} {st.get('reason') or '':<16} "
+                    f"{st.get('summary', '')}"
+                )
             for r in res.sql_reviews:
                 print(f"\nSQL {r['step_id']} ({r.get('backend')}):\n{r.get('sql')}")
         if args.export:
@@ -150,6 +174,14 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     client = SocrataClient(s.socrata_domain, token)
     res = ingest_dataset(ds, client, since=args.since, limit=args.limit)
     print(f"Ingested {res.rows:,} rows into {res.path} (where: {res.where})")
+    if res.date_min:
+        print(f"Stored dates: {res.date_min} to {res.date_max}")
+    if res.limit_reached:
+        print(
+            "WARNING: the download stopped at the row limit, so the stored copy is a subset "
+            "(see 'order' in config/datasets.yaml). Use --since/--limit to choose the period you need.",
+            file=sys.stderr,
+        )
     print("Restart the app (or click 'New conversation') to load the data in 'local' mode.")
     return 0
 

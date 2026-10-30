@@ -45,14 +45,106 @@ def render_answer(turn: TurnResult) -> None:
         with st.expander(f"Limitations and caveats ({len(lims)})", expanded=False):
             for item in lims:
                 st.markdown(f"- {item}")
+    render_data_scope(turn, compact=True)
     meta = []
-    src = {"llm": "LLM plan", "rules": "deterministic plan", "rules_fallback": "deterministic fallback plan"}
-    meta.append(src.get(turn.plan_source, turn.plan_source))
     meta.append(f"narrative: {ans.get('narrator', 'template')}")
     meta.append(f"{turn.elapsed_s:.1f}s")
     st.caption(" · ".join(meta))
     if ans.get("adjustments"):
         st.caption("Guardrails applied: " + "; ".join(ans["adjustments"]))
+
+
+PLAN_SOURCES = {
+    "llm": "LLM plan (checked against the question)",
+    "rules": "deterministic plan",
+    "rules_fallback": "deterministic fallback plan",
+}
+
+
+def data_scope_rows(turn: TurnResult) -> list[dict[str, Any]]:
+    rows = []
+    for d in (turn.data_scope or {}).get("datasets", []):
+        cov = d.get("coverage") or {}
+        where = ", ".join(d.get("boroughs") or []) or ", ".join(d.get("areas") or []) or "citywide"
+        if d.get("boroughs") and d.get("areas"):
+            where += " · " + ", ".join(d["areas"])
+        stored = f"{cov['date_min']} to {cov['date_max']}" if cov.get("date_min") else "not measured"
+        complete = "unknown" if not cov.get("computed_by") or cov.get("computed_by") == "unknown" else "yes"
+        if cov.get("limit_reached"):
+            complete = "no — download stopped at the row limit"
+        elif cov.get("is_subset"):
+            complete = "subset (ingestion filter)"
+        matching = d.get("matching_rows")
+        if d.get("rows_in_areas") is not None:
+            matching = f"{d['rows_in_areas']:,} in area ({(matching or 0):,} before area filter)"
+        rows.append(
+            {
+                "Dataset": d.get("name"),
+                "Stored dates": stored,
+                "Stored records": f"{cov['rows']:,}" if cov.get("rows") is not None else "—",
+                "Date range applied": d.get("requested_text"),
+                "Categories": ", ".join(map(str, d.get("categories") or [])) or "all",
+                "Geography": where,
+                "Other filters": "; ".join(
+                    f"{f['column']} {f['op']} {f.get('value')}" for f in d.get("filters") or []
+                )
+                or "—",
+                "Matching records": f"{matching:,}" if isinstance(matching, int) else (matching or "—"),
+                "Complete copy": complete,
+            }
+        )
+    return rows
+
+
+def _step_prefix(entry: dict[str, Any]) -> str:
+    return f"{entry['step']}: " if entry.get("step") else ""
+
+
+def render_data_scope(turn: TurnResult, compact: bool = True) -> None:
+    """What data the answer is based on: dataset, stored coverage, filters, counts, corrections."""
+    ds = turn.data_scope or {}
+    corrections = [v for v in turn.validation if v.get("kind") in ("removed", "changed", "added", "rejected")]
+    assumptions = [v for v in turn.validation if v.get("kind") == "assumption"]
+    if not ds and not corrections:
+        return
+    rows = data_scope_rows(turn)
+    if compact:
+        bits = [f"Planner: {PLAN_SOURCES.get(turn.plan_source, turn.plan_source)}"]
+        if ds.get("period"):
+            bits.append(f"period: {ds['period']}")
+        for r in rows[:2]:
+            bits.append(
+                f"{r['Dataset']}: {r['Matching records']} matching · stored {r['Stored records']} "
+                f"({r['Stored dates']})"
+            )
+        st.caption(" · ".join(bits))
+    else:
+        st.markdown("**Data scope**")
+        st.caption(
+            f"Planner: {PLAN_SOURCES.get(turn.plan_source, turn.plan_source)} · requested period: "
+            f"{ds.get('period', 'all available dates')}"
+        )
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        for d in ds.get("datasets", []):
+            cov = d.get("coverage") or {}
+            for n in cov.get("notes") or []:
+                st.caption(f"• {d.get('name')}: {n}")
+            if cov.get("ingest_where"):
+                st.caption(f"• {d.get('name')} ingestion filter: `{cov['ingest_where']}`")
+    for w in ds.get("warnings", []):
+        st.warning(w, icon="⚠️")
+    if corrections:
+        with st.expander(f"Plan corrections ({len(corrections)})", expanded=not compact):
+            st.caption(
+                "Filters or parameters the question did not ask for were corrected before anything ran."
+            )
+            for c in corrections:
+                st.markdown(f"- {_step_prefix(c)}{c['message']}")
+    if assumptions and not compact:
+        st.markdown("**Assumptions**")
+        for a in assumptions:
+            st.markdown(f"- {_step_prefix(a)}{a['message']}")
 
 
 def render_results_table(session: AgentSession, turn: TurnResult) -> None:
@@ -148,6 +240,7 @@ def render_reasoning(turn: TurnResult) -> None:
 
 
 def render_provenance(turn: TurnResult) -> None:
+    render_data_scope(turn, compact=False)
     if turn.citations:
         st.markdown("**Datasets used**")
         rows = []
@@ -188,6 +281,15 @@ def build_report(session: AgentSession, turn: TurnResult) -> str:
     for f in ans.get("findings", []):
         lines.append(f"- **{f['kind']}** — {f['text']}")
     lines += ["", "## Limitations"] + [f"- {x}" for x in ans.get("limitations", [])]
+    rows = data_scope_rows(turn)
+    if rows:
+        lines += ["", "## Data scope"]
+        for r in rows:
+            lines.append("- " + "; ".join(f"{k}: {v}" for k, v in r.items()))
+        lines += [f"- ⚠ {w}" for w in (turn.data_scope or {}).get("warnings", [])]
+    fixes = [v for v in turn.validation if v.get("kind") in ("removed", "changed", "added", "rejected")]
+    if fixes:
+        lines += ["", "## Plan corrections"] + [f"- {v['message']}" for v in fixes]
     lines += ["", "## Plan", f"Interpretation: {(turn.plan or {}).get('interpretation', '')}", ""]
     for s in turn.steps:
         lines.append(f"- `{s['step_id']}` **{s['tool']}** ({s['status']}): {s.get('summary', '')}")

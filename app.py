@@ -74,7 +74,11 @@ def ensure_session(mode: str, provider: str, model: str, reset: bool) -> AgentSe
 registry_for_sidebar = get_local_engine(st.session_state.get("mode", settings.mode), _registry_fingerprint())[
     0
 ]
-sb = render_sidebar(settings, registry_for_sidebar)
+sb = render_sidebar(
+    settings,
+    registry_for_sidebar,
+    coverage=lambda m: get_local_engine(m, _registry_fingerprint())[1].coverage,
+)
 session = ensure_session(sb.mode, sb.provider, sb.model, sb.new_conversation)
 rt = session.runtime
 

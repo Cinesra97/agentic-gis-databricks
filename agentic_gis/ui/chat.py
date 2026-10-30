@@ -35,6 +35,11 @@ def _assistant_block(turn: TurnResult, show_followups: bool) -> None:
         st.markdown(f":{color}-badge[{label}] {f.get('text', '')}")
     if turn.status == "clarification":
         st.caption("Reply below to continue.")
+    for w in ((turn.data_scope or {}).get("warnings") or [])[:2]:
+        st.caption(f"⚠️ {w}")
+    n_fix = sum(1 for v in turn.validation if v.get("kind") in ("removed", "changed", "added", "rejected"))
+    if n_fix:
+        st.caption(f"🛠 {n_fix} plan correction(s) were made to match the question (see Data & methods).")
     if show_followups and ans.get("suggested_follow_ups"):
         cols = st.columns(len(ans["suggested_follow_ups"][:3]))
         for i, q in enumerate(ans["suggested_follow_ups"][:3]):

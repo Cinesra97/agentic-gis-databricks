@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,7 +36,11 @@ def _ollama_models(base_url: str) -> list[str]:
     return OllamaClient(base_url, "probe").list_models()
 
 
-def render_sidebar(settings: Settings, registry: DatasetRegistry) -> SidebarState:
+def render_sidebar(
+    settings: Settings,
+    registry: DatasetRegistry,
+    coverage: Callable[[str], dict[str, Any]] | None = None,
+) -> SidebarState:
     sb = st.sidebar
     sb.markdown("### 🗺️ Agentic GIS")
     sb.caption("Natural-language spatial analysis · local LLM · governed data access")
@@ -112,7 +117,7 @@ def render_sidebar(settings: Settings, registry: DatasetRegistry) -> SidebarStat
     )
 
     with sb.expander("Data catalog", expanded=False):
-        _catalog(registry, mode)
+        _catalog(registry, mode, coverage(mode) if coverage else {})
     with sb.expander("Safety & governance", expanded=False):
         st.markdown(
             f"- SQL approval: **{settings.sql_approval}**\n"
@@ -139,18 +144,27 @@ def render_sidebar(settings: Settings, registry: DatasetRegistry) -> SidebarStat
     )
 
 
-def _catalog(registry: DatasetRegistry, mode: str) -> None:
+def _catalog(registry: DatasetRegistry, mode: str, coverage: dict[str, Any] | None = None) -> None:
     rows = []
     for ds in registry.all():
         if mode not in ds.modes:
             continue
         status = registry.status(ds)
+        cov = (coverage or {}).get(ds.id)
+        stored = ""
+        if cov is not None and getattr(cov, "rows", None) is not None:
+            stored = f"{cov.rows:,} rows"
+            if cov.date_min:
+                stored += f", {cov.date_min} to {cov.date_max}"
+            if cov.limit_reached:
+                stored += " (row limit reached: subset)"
         rows.append(
             {
                 "id": ds.id,
                 "name": ds.name,
                 "role": ds.role,
                 "status": status.state,
+                "stored": stored,
                 "synthetic": "yes" if ds.synthetic else "",
                 "sensitivity": ds.sensitivity,
             }
