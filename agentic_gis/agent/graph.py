@@ -363,13 +363,13 @@ def narration_blocker(
     """Why the LLM may not narrate this result (None = it may)."""
     if rt.llm is None:
         return "No LLM is configured; the deterministic summary is used."
+    sel = main_selection(steps, {d.id for d in datasets if d.role == "events"})
+    if sel is not None and not sel.get("rows"):
+        return "No matching records, so the deterministic summary was used (no LLM narration)."
     if not steps or not any(s.get("status") == "ok" for s in steps):
         return "No step produced results, so the deterministic summary is used (no LLM narration)."
     if not rt.policy.may_include_results(datasets):
         return "The data policy does not allow sending these results to the LLM."
-    sel = main_selection(steps, {d.id for d in datasets if d.role == "events"})
-    if sel is not None and not sel.get("rows"):
-        return "No matching records, so the deterministic summary was used (no LLM narration)."
     return None
 
 

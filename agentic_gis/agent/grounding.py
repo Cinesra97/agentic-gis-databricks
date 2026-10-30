@@ -191,6 +191,13 @@ def _supported(value: float, evidence: set[float], pct: bool) -> bool:
     return False
 
 
+def _quoted_from_results(body: str, m: re.Match[str], ev: Evidence) -> bool:
+    """True if the match is part of a name taken from the results (e.g. an address)."""
+    nxt = re.match(r"\s+[\w-]+", body[m.end() :])
+    phrase = normalize_name(m.group(0) + (nxt.group(0) if nxt else ""))
+    return bool(nxt) and f" {phrase} " in ev.text
+
+
 def check_narrative(
     answer: Answer | Narration,
     ev: Evidence,
@@ -208,7 +215,9 @@ def check_narrative(
         *getattr(answer, "limitations", []),
     ]
     body = "\n".join(texts)
-    if ev.synthetic is False and _SYNTHETIC_CLAIM.search(body):
+    if ev.synthetic is False and any(
+        not _quoted_from_results(body, m, ev) for m in _SYNTHETIC_CLAIM.finditer(body)
+    ):
         problems.append("describes the data as synthetic or demonstration data, but the datasets are real")
     if ev.synthetic is True and _REAL_CLAIM.search(body):
         problems.append("describes synthetic demonstration data as real data")

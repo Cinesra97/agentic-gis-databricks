@@ -56,7 +56,10 @@ def _shift(
     return a + frac * (b - a)
 
 
-def _write_fixture(folder: Path, dumping_rows: int | None = None) -> DatasetRegistry:
+def _write_fixture(folder: Path, dumping_rows: int | None = None, synthetic: bool = True) -> DatasetRegistry:
+    """Write the fixture. ``synthetic=False`` registers it with the metadata of a real ingested dataset
+    (as for a user's NYC Open Data download) to test provenance labeling; the values themselves are
+    still the synthetic sample and exist only in a temporary test directory."""
     src = gpd.read_parquet(PROJECT_ROOT / "sample_data" / "synthetic_311_sanitation.parquet")
     lo, hi = src["created_date"].min(), src["created_date"].max()
     a, b = pd.Timestamp(f"{START} 00:00:00"), pd.Timestamp(f"{END} 12:00:00")
@@ -91,7 +94,7 @@ def _write_fixture(folder: Path, dumping_rows: int | None = None) -> DatasetRegi
     overlay.write_text(
         "datasets:\n"
         f"  - id: {DS}\n"
-        "    synthetic: true\n"  # the fixture is synthetic data and stays labeled as such
+        f"    synthetic: {'true' if synthetic else 'false'}\n"
         "    source:\n"
         "      type: socrata\n"
         f"      path: {path.as_posix()}\n"
