@@ -32,7 +32,13 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlglot import exp
 
 from agentic_gis.agent.workspace import Artifact, ResultStore
-from agentic_gis.config.registry import DatasetRegistry, DatasetSpec, UnknownDatasetError
+from agentic_gis.config.registry import (
+    DatasetRegistry,
+    DatasetSpec,
+    UnknownDatasetError,
+    is_point_location_column,
+    location_columns_for,
+)
 from agentic_gis.config.settings import Settings
 from agentic_gis.connectors.base import ColumnInfo, ConnectorError, QueryEngine
 from agentic_gis.connectors.coverage import DatasetCoverage
@@ -556,6 +562,80 @@ def eval_list(text: str) -> list[str]:
     return [x.strip().strip("'\"") for x in text.strip("[]").split(",") if x.strip()]
 
 
+_AREA_PREFIX = [
+    (r"zip|postal|postcode|modzcta", "ZIP "),
+    (r"community_board|^cb", "community board "),
+    (r"community_district|^cd_|cd_code", "community district "),
+]
+
+
+def _clean(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return text or None
+
+
+def describe_place(
+    row: Any,
+    label_columns: list[str],
+    ds: DatasetSpec | None,
+    lat: float | None = None,
+    lon: float | None = None,
+    area: str | None = None,
+) -> tuple[str, str]:
+    """Describe where a result is: ``(text, level)`` with level ``point`` | ``coordinates`` | ``area``.
+
+    Uses the most specific location attribute available (address, then street); otherwise the
+    coordinates plus the most specific area (ZIP, community board, neighborhood, borough).
+    """
+    vals = {c: _clean(row.get(c)) for c in label_columns}
+    boro = next((v for c, v in vals.items() if v and re.search("boro", c, re.I)), None)
+    point = next((v for c, v in vals.items() if v and is_point_location_column(c, ds)), None)
+    if point:
+        return (
+            f"near {point}" + (f", {boro}" if boro and boro.upper() not in point.upper() else ""),
+            "point",
+        )
+    if area is None:
+        for c, v in vals.items():
+            if v and not is_point_location_column(c, ds) and not re.search("boro", c, re.I):
+                prefix = next((pre for rx, pre in _AREA_PREFIX if re.search(rx, c, re.I)), "")
+                area = f"{prefix}{v}"
+                break
+    if area and boro and boro.upper() not in area.upper():
+        area = f"{area}, {boro}"
+    area = area or boro
+    if lat is not None and lon is not None and not (pd.isna(lat) or pd.isna(lon)):
+        return (f"around {lat:.5f}, {lon:.5f}" + (f" ({area})" if area else ""), "coordinates")
+    return ((f"in {area}" if area else "at an unnamed location"), "area")
+
+
+def area_for_point(ctx: ToolContext, lat: float, lon: float) -> str | None:
+    """Name of the neighborhood / community district containing a point (local reference data)."""
+    from shapely.geometry import Point
+
+    roles = ctx.registry.geography_roles(ctx.mode)
+    for role in ("neighborhood", "community_district"):
+        if role not in roles:
+            continue
+        try:
+            gds, gg = ctx.geography(role)
+        except Exception as exc:  # reference data problems must not break the description
+            log.info("Area lookup via %s failed: %s", role, exc)
+            continue
+        hit = gg[gg.geometry.contains(Point(lon, lat))]
+        col = gds.name_column if gds.name_column in hit.columns else None
+        if len(hit) and col:
+            return f"{role.replace('_', ' ')} {hit.iloc[0][col]}"
+    return None
+
+
 def restrict_areas_to_input(areas: gpd.GeoDataFrame, points: pd.DataFrame) -> gpd.GeoDataFrame:
     """When the input was filtered to some boroughs, keep only areas in those boroughs."""
     if "borough" in areas.columns and "borough" in points.columns:
@@ -815,9 +895,15 @@ def render_filter_sql(ctx: ToolContext, a: FilterDatasetArgs) -> RenderedSQL:
     for kc in (ds.id_column, ds.category_column, ds.temporal.column if ds.temporal else None, ds.name_column):
         if kc and kc.lower() in names:
             must.add(names[kc.lower()])
+    # Columns that say where a record is (address, street, ZIP, community board, borough) are always
+    # kept, so a narrowed column list from the planner cannot strip what later steps need to name places.
+    location = [names[c.lower()] for c in location_columns_for(ds, [ci.name for ci in cols])]
     if a.columns:
         chosen = [col(name).name for name in a.columns]
-        selected = list(dict.fromkeys(chosen + sorted(must)))
+        added = [c for c in location if c not in chosen and c not in must]
+        selected = list(dict.fromkeys(chosen + sorted(must) + location))
+        if added:
+            notes.append(f"Kept location columns {', '.join(added)} so places can be named.")
     else:
         selected = [ci.name for ci in cols if ci.name.lower() not in sensitive]
 
@@ -1493,21 +1579,43 @@ def build_default_registry() -> ToolRegistry:
             )
         cat = spec.category_column if spec and spec.category_column in ig.columns else None
         dcol = spec.temporal.column if spec and spec.temporal and spec.temporal.column in ig.columns else None
-        labels = [
-            c
-            for c in ("incident_address", "street_name", "borough", "cd_code", "community_board")
-            if c in ig.columns
-        ]
+        labels = (
+            location_columns_for(spec, [str(c) for c in ig.columns])
+            if spec
+            else [
+                c
+                for c in ("incident_address", "street_name", "community_board", "borough")
+                if c in ig.columns
+            ]
+        )
         res = A.dbscan_clusters(
             ig, ctx.settings.projected_crs, a.radius, a.units, a.min_points, cat, dcol, labels
         )
         out = res.data
+        top_level = None
+        if len(out):
+            described = [
+                describe_place(r, labels, spec, r.get("center_lat"), r.get("center_lon"))
+                for _, r in out.iterrows()
+            ]
+            top_level = described[0][1]
+            if top_level == "coordinates" and not any(
+                not is_point_location_column(c, spec) and not re.search("boro", c, re.I) for c in labels
+            ):  # no area attribute in the data: look the area up in local reference boundaries
+                top = out.iloc[0]
+                area = area_for_point(ctx, float(top["center_lat"]), float(top["center_lon"]))
+                if area:
+                    described[0] = describe_place(
+                        top, labels, spec, top["center_lat"], top["center_lon"], area
+                    )
+            out.insert(min(2, len(out.columns)), "location", [d[0] for d in described])
+        notes = list(res.notes)
         art = ctx.save(
             f"Clusters of {ia.title} (≥{a.min_points} within {a.radius:g} {a.units})",
             out,
             "find_hotspots",
             [ia],
-            notes=res.notes,
+            notes=notes,
         )
         hl = [
             f"{res.stats['clusters']} clusters contain {res.stats['clustered_points']:,} of {len(ig):,} reports."
@@ -1523,16 +1631,21 @@ def build_default_registry() -> ToolRegistry:
         }
         if len(out):
             top = out.iloc[0]
-            where = top.get("incident_address") or top.get("street_name") or top.get("cd_code") or ""
-            boro = top.get("borough") or ""
             span = (
                 f" over {top['span_days']} days"
                 if "span_days" in out and pd.notna(top.get("span_days"))
                 else ""
             )
-            hl.append(f"Largest cluster: {int(top['count'])} reports{span} near {where} {boro}".strip() + ".")
+            hl.append(f"Largest cluster: {int(top['count'])} reports{span} {top['location']}.")
             facts["largest_count"] = int(top["count"])
-            facts["largest_near"] = f"{where} {boro}".strip()
+            facts["largest_location"] = str(top["location"])
+            facts["largest_location_level"] = top_level
+            facts["largest_center"] = [float(top["center_lat"]), float(top["center_lon"])]
+            if top_level != "point" and not any(is_point_location_column(c, spec) for c in labels):
+                notes.append(
+                    "The input has no address or street column, so clusters are described by their center "
+                    "coordinates and area."
+                )
         headline = (
             f"{len(out)} locations with {a.min_points}+ {ia.title} within {a.radius:g} {a.units} of each other"
             if len(out)
@@ -1548,7 +1661,7 @@ def build_default_registry() -> ToolRegistry:
             headline=headline,
             artifact_id=art.id,
             rows=len(out),
-            notes=res.notes,
+            notes=notes,
             datasets=art.datasets,
         )
 

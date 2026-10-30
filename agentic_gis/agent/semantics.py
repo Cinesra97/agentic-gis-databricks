@@ -29,7 +29,12 @@ from sqlglot import exp
 from agentic_gis.agent.state import Plan, PlanStep
 from agentic_gis.agent.temporal import describe_window, parse_time_window, window_contains
 from agentic_gis.agent.tools import normalize_borough, resolve_categories
-from agentic_gis.config.registry import DatasetRegistry, DatasetSpec, UnknownDatasetError
+from agentic_gis.config.registry import (
+    DatasetRegistry,
+    DatasetSpec,
+    UnknownDatasetError,
+    location_columns_for,
+)
 from agentic_gis.spatial.geometry import UNIT_TO_METERS
 from agentic_gis.spatial.operations import normalize_name
 
@@ -792,8 +797,19 @@ class SemanticValidator:
         res.corrections += out.corrections
         if out.violations:
             res.rejected += [f"{st.id}: {v}" for v in out.violations]
-        elif out.sql != st.args.get("sql"):
-            st.args["sql"] = out.sql
+            return True
+        sql, added = widen_sql_projection(out.sql, dialect, self.registry, self.mode, backend)
+        if added:
+            res.corrections.append(
+                Correction(
+                    "added",
+                    f"Added location columns {', '.join(added)} to the SQL so the places in the result can be named.",
+                    st.id,
+                    "columns",
+                )
+            )
+        if sql != st.args.get("sql"):
+            st.args["sql"] = sql
         return True
 
     # ---- whole-plan checks ---------------------------------------------------------------
@@ -927,6 +943,59 @@ def _tree_datasets(tree: Any, registry: DatasetRegistry, mode: str, backend: str
                     if ds not in datasets:
                         datasets.append(ds)
     return datasets
+
+
+def widen_sql_projection(
+    sql: str, dialect: str, registry: DatasetRegistry, mode: str, backend: str
+) -> tuple[str, list[str]]:
+    """Add missing location/spatial columns to a simple record-level SELECT over one dataset.
+
+    Only plain ``SELECT cols FROM table [WHERE ...]`` queries are widened (no joins, grouping,
+    aggregates, DISTINCT, window functions, CTEs or subqueries in FROM), so the row set is unchanged.
+    Returns the (possibly) rewritten SQL and the columns added.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, read=dialect)
+    except Exception:
+        return sql, []
+    if not isinstance(tree, exp.Select):
+        return sql, []
+    frm = tree.args.get("from_") or tree.args.get("from")  # key name differs across sqlglot versions
+    if (
+        frm is None
+        or not isinstance(frm.this, exp.Table)
+        or tree.args.get("joins")
+        or tree.args.get("group")
+        or tree.args.get("distinct")
+        or tree.args.get("with_")
+        or tree.args.get("with")
+        or tree.find(exp.AggFunc)
+        or tree.find(exp.Window)
+    ):
+        return sql, []
+    if any(
+        isinstance(e, exp.Star) or isinstance(getattr(e, "this", None), exp.Star) for e in tree.expressions
+    ):
+        return sql, []
+    found = _tree_datasets(tree, registry, mode, backend)
+    if len(found) != 1 or found[0].spatial is None or not found[0].columns:
+        return sql, []
+    ds = found[0]
+    sp = ds.spatial
+    if sp is None:
+        return sql, []
+    present = {e.alias_or_name.lower() for e in tree.expressions}
+    spatial_cols = [
+        c for c in (sp.geometry_column, sp.lat_column, sp.lon_column) if c and c in ds.column_names
+    ]
+    want = location_columns_for(ds, ds.column_names) + spatial_cols
+    add = [c for c in want if c.lower() not in present and c.lower() not in ds.sensitive_columns]
+    if not add:
+        return sql, []
+    qualifier = frm.this.alias_or_name if frm.this.alias else None
+    for c in add:
+        tree = tree.select(exp.column(c, table=qualifier, quoted=True), append=True, copy=False)
+    return tree.sql(dialect=dialect), add
 
 
 def sql_datasets(sql: str, dialect: str, registry: DatasetRegistry, mode: str, backend: str) -> list[str]:

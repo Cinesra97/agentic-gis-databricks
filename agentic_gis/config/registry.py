@@ -149,6 +149,12 @@ class DatasetSpec(BaseModel):
     id_column: str | None = None
     category_column: str | None = None
     join_keys: dict[str, str] = Field(default_factory=dict)
+    location_columns: list[str] = Field(
+        default_factory=list,
+        description="Columns that say where a record is, most specific first (address, street, ZIP, "
+        "community board, borough). Always kept in query results so places can be named. Derived from "
+        "column names when empty.",
+    )
     columns: list[ColumnSpec] = Field(default_factory=list)
     schema_discovery: bool = False
     verification_source: bool = Field(
@@ -205,6 +211,11 @@ class DatasetSpec(BaseModel):
                 return c
         return None
 
+    @property
+    def descriptive_location_columns(self) -> list[str]:
+        """Location-describing columns among the registered ones (see :func:`location_columns_for`)."""
+        return location_columns_for(self, [c.name for c in self.columns])
+
     def known_categories(self) -> list[str]:
         if not self.category_column:
             return []
@@ -217,6 +228,59 @@ class DatasetSpec(BaseModel):
         parts += self.known_categories()
         parts += list(self.synonyms)
         return " ".join(parts).lower()
+
+
+# Column-name patterns for place descriptions, most specific first. Point-level patterns name a
+# spot (address, street); the rest name an area.
+POINT_LOCATION_PATTERNS = [r"address", r"street|intersection|cross_?st|on_st|location_name|site_name"]
+AREA_LOCATION_PATTERNS = [
+    r"zip|postal|postcode",
+    r"community_board|community_district|^cd_|cd_code|^cb_?\d*$",
+    r"neighbo|^nta",
+    r"boro",
+]
+
+
+def location_columns_for(ds: DatasetSpec, available: list[str]) -> list[str]:
+    """Columns of ``available`` that describe where a record is, most specific first.
+
+    Uses the dataset's ``location_columns`` when configured; otherwise derives them from column names
+    (address, street, the dataset's name column, ZIP, community board, neighborhood, borough) and join
+    keys. Sensitive columns and geometry/coordinates are never included (coordinates are kept
+    separately as spatial columns).
+    """
+    by_lower = {a.lower(): a for a in available}
+    sensitive = ds.sensitive_columns
+    skip = (
+        {c.lower() for c in (ds.spatial.geometry_column, ds.spatial.lat_column, ds.spatial.lon_column) if c}
+        if ds.spatial
+        else set()
+    )
+    if ds.location_columns:
+        wanted = [c.lower() for c in ds.location_columns]
+    else:
+        wanted = []
+        names = [a.lower() for a in available if a.lower() not in skip]
+        for pat in POINT_LOCATION_PATTERNS[:1]:
+            wanted += [n for n in names if re.search(pat, n)]
+        if ds.name_column and ds.role in ("streets", "parcels", "infrastructure"):
+            wanted.append(ds.name_column.lower())
+        for pat in POINT_LOCATION_PATTERNS[1:] + AREA_LOCATION_PATTERNS:
+            wanted += [n for n in names if re.search(pat, n)]
+        wanted += [v.lower() for v in ds.join_keys.values()]
+    out: list[str] = []
+    for w in wanted:
+        if w in by_lower and w not in sensitive and w not in skip and by_lower[w] not in out:
+            out.append(by_lower[w])
+    return out
+
+
+def is_point_location_column(name: str, ds: DatasetSpec | None = None) -> bool:
+    """True if the column names a specific spot (address/street) rather than an area."""
+    n = name.lower()
+    if ds is not None and ds.name_column and n == ds.name_column.lower() and ds.role != "boundary":
+        return True
+    return any(re.search(p, n) for p in POINT_LOCATION_PATTERNS)
 
 
 class DatasetStatus(BaseModel):

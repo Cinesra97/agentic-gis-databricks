@@ -156,6 +156,7 @@ datasets:
     id_column: unique_key
     category_column: complaint_type
     join_keys: {borough: borough, community_board: community_board, cd_code: cd_code, incident_zip: incident_zip}
+    location_columns: [incident_address, street_name, incident_zip, community_board, cd_code, borough]
     columns:
       - {name: unique_key, type: integer, description: Synthetic request id (900000001+)}
       - {name: created_date, type: timestamp, description: When the complaint was created}
@@ -328,6 +329,7 @@ datasets:
     id_column: unique_key
     category_column: complaint_type
     join_keys: {borough: borough, community_board: community_board, incident_zip: incident_zip}
+    location_columns: [incident_address, street_name, incident_zip, community_board, borough]
     columns:
       - {name: unique_key, type: integer, description: 311 request id}
       - {name: created_date, type: timestamp, description: When the request was created}

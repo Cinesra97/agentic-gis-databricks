@@ -352,10 +352,13 @@ def dbscan_clusters(
         member_geoms = geoms[idx]
         hull = shapely.convex_hull(shapely.multipoints(member_geoms)).buffer(eps / 2)
         locs = len({(round(x / 3), round(y / 3)) for x, y in xy[idx]})  # ~3 ft precision
+        cx, cy = xy[idx].mean(axis=0)
         row: dict[str, Any] = {
             "cluster_id": cid,
             "count": len(idx),
             "distinct_locations": locs,
+            "_cx": float(cx),
+            "_cy": float(cy),
             "geometry": hull,
         }
         sub = pp.iloc[idx]
@@ -378,6 +381,12 @@ def dbscan_clusters(
         clusters = gpd.GeoDataFrame(rows, geometry="geometry", crs=projected_crs)
         clusters = clusters.sort_values("count", ascending=False).reset_index(drop=True)
         clusters["rank"] = np.arange(1, len(clusters) + 1)
+        # mean member position, in WGS84, for describing places without an address
+        centers = gpd.GeoSeries(gpd.points_from_xy(clusters["_cx"], clusters["_cy"]), crs=projected_crs)
+        centers = centers.to_crs("EPSG:4326")
+        clusters["center_lat"] = centers.y.round(6).values
+        clusters["center_lon"] = centers.x.round(6).values
+        clusters = clusters.drop(columns=["_cx", "_cy"])
     else:
         clusters = gpd.GeoDataFrame({"cluster_id": [], "count": []}, geometry=[], crs=projected_crs)
     clustered = int((cluster_ids > 0).sum())

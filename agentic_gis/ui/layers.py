@@ -370,6 +370,7 @@ def build_layer_spec(
 _VALUE_PREFERENCE = ["change", "value", "count", "match_count", "gi_z", "per_1000ft"]
 _TOOLTIP_PREFERENCE = [
     "label",
+    "location",
     "neighborhood",
     "boro_name",
     "street_name",
