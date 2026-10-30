@@ -33,6 +33,8 @@ config/). `app.py` is the Streamlit entry point; `config/datasets.yaml` is the d
   category or attribute filter the question did not ask for. Tools with such parameters need a
   `_check_<tool>` in `SemanticValidator`. Empty results are "no matching records", never "no incidents";
   periods outside the stored coverage get an insufficient-coverage answer.
+* Limitations, provenance (real/synthetic) and coverage notes are computed, never model-written; LLM narration
+  only rewrites the explanation and must pass `grounding.check_narrative`. Keep `location_columns` in reads.
 * Keep synthetic data labeled (`synthetic: true`, `is_synthetic`, titles, answers). Never describe
   complaint locations as confirmed violations; imagery results are candidates.
 * Distances/areas in a projected CRS (`settings.projected_crs`, EPSG:2263 default).

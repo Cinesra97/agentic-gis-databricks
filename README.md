@@ -72,7 +72,9 @@ flowchart LR
 * Every plan is checked against what the question asked (period, boroughs, categories, places, distances),
   parsed deterministically: filters the question did not ask for — such as a date range the model made up —
   are removed and shown as corrections. Questions about periods that are not in the stored data get an
-  “insufficient coverage” answer, and the LLM's answer is checked against the computed numbers.
+  “insufficient coverage” answer. Answers are written deterministically from the computed results by
+  default; an optional LLM rewrite (setting or per-answer button) is checked against the results, and
+  limitations and data notes are never model-written.
 * Results live in a per-session artifact store; map layers follow a **standard JSON schema**
   ([docs/MAP_LAYERS.md](docs/MAP_LAYERS.md)) rendered by Leaflet (Folium) or deck.gl (PyDeck).
 * Answers separate **observations** (computed), **inferences** (interpretation) and **verified** findings

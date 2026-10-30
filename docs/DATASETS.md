@@ -40,6 +40,7 @@ only contain identifier characters.
   id_column: unique_key
   category_column: complaint_type
   join_keys: {borough: borough, cd_code: cd_code}
+  location_columns: [incident_address, street_name, incident_zip, community_board, borough]  # most specific first
   columns:
     - {name: complaint_type, type: string, description: ..., known_values: [Illegal Dumping, ...]}
     - {name: caller_phone, type: string, sensitive: true}   # hidden from LLM, blocked in SQL
@@ -91,10 +92,31 @@ date from the loaded data (no extra file scan) and combines it with the sidecar:
 * questions about a period outside the stored range get an “insufficient coverage” answer instead of an
   empty result; partial overlaps and truncated downloads are disclosed in the answer.
 
-To cover a longer period, ingest it explicitly, e.g.
-`uv run agentic-gis ingest nyc_311_sanitation --since 2024-01-01 --limit 1000000` (mind memory: DuckDB and
-GeoPandas hold the data in RAM), or narrow the `where` filter in `config/datasets.local.yaml`. Older
-sidecars without the new fields are still read; the configured limit is then assumed.
+**Getting a historical period.** `--since` alone does not reach older records: the 311 download is ordered
+newest-first and stops at the row limit, so it keeps the most recent records again. Download a **bounded
+window** instead:
+
+```powershell
+uv run agentic-gis ingest nyc_311_sanitation --since 2020-01-01 --until 2023-12-31 --limit 1500000
+```
+
+The command first asks the portal how many records match the window and prints that count next to the limit;
+the sidecar records it, and the app reports “only N of M records were downloaded” if the limit cut the window.
+Choose a `--limit` at least as large as the count (memory: DuckDB holds the table in RAM and GeoPandas holds
+each selection again, so check memory use before ingesting millions of rows), or split a long period into
+smaller windows. Pages are
+fetched with offset paging ordered by the configured `order` plus the row id (`:id`), so records with equal
+timestamps are neither skipped nor repeated.
+
+Ingesting **replaces** the stored copy. To keep two periods side by side, register a second dataset in
+`config/datasets.local.yaml` (copy the `nyc_311_sanitation` entry, give it a new `id`, `table` and
+`source.path`) and ingest the window into it. Older sidecars without the new fields are still read; the
+configured limit is then assumed.
+
+**Location columns.** `location_columns` lists the columns that say where a record is, most specific first.
+They are always kept in query results, even when a plan asks for a narrower column list, so clusters and
+other results can be described by address or street. Without the field they are derived from column names
+(address, street, ZIP, community board, neighborhood, borough). Sensitive columns are never included.
 
 ## Adding a local file dataset
 

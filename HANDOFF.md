@@ -31,7 +31,7 @@ uv run streamlit run app.py
 | 4 — Imagery architecture (tiling, embedding records/stores, candidate-only search, roadmap) | Interfaces + placeholders done; no imagery or model integrated (by design) |
 | Reliability fix (2026-10-30): invented LLM filters, coverage, empty results, grounded answers | Done; tested offline with a synthetic 2026 fixture and a scripted fake model; **not yet run with a real model or your ingested file** |
 
-Checks at handoff: 137 tests passed, 2 opt-in live tests skipped; ruff (lint + format) and mypy clean.
+Checks at handoff: 158 tests passed, 2 opt-in live tests skipped; ruff (lint + format) and mypy clean.
 
 ## Reliability fix (2026-10-30)
 
@@ -71,6 +71,45 @@ uv run agentic-gis ask --provider ollama -v "Find locations in NYC with repeated
 uv run agentic-gis ask --provider ollama -v "Find repeated illegal dumping complaints between 2020 and 2023."
 #   expect: [insufficient_coverage] with the stored dates
 uv run streamlit run app.py                   # restart so the new code and coverage profiling load
+```
+
+## Follow-up fixes after the live test (2026-10-30)
+
+Your live run (qwen2.5:7b, narration off) confirmed the main fix: plan source `llm`, 20,323 records,
+448 clusters / 3,457 reports, 60.8 s. Remaining issues and fixes:
+
+1. **Largest cluster “near QUEENS”.** The model's `filter_dataset` call passed its own `columns` list without
+   `incident_address`/`street_name`. Datasets now declare `location_columns` (configured for 311, derived
+   from column names otherwise); structured reads always keep them, simple LLM `SELECT`s get them added
+   before approval, and `find_hotspots` describes each cluster from them (address → street → center
+   coordinates + area, with a reference-boundary lookup when the data has no area column). Clusters also
+   get `location`, `center_lat`, `center_lon` columns.
+2. **False limitations with narration on** (“synthetic demonstration data”, “does not cover the full period
+   requested”). The model no longer writes limitations, provenance or follow-ups: it only rewrites
+   headline/summary/findings, and those are checked for synthetic/real claims (dataset metadata), period
+   coverage claims (request scope + stored coverage) and truncation claims (ingestion record), besides
+   numbers/years/places. The legitimate 150,000-row truncation note is computed and always shown.
+3. **Narration cost** (178.7 s vs 60.8 s). `AGIS_LLM_NARRATION` now defaults to **false**. A single answer
+   can be rewritten on request (UI button “Rewrite this summary with the LLM”, `ask --narrate`). When used,
+   the prompt is ~36% smaller and output is capped (`AGIS_LLM_NARRATION_MAX_TOKENS=450`); the time is shown
+   next to the narrator and in the audit log.
+4. **Re-ingest advice.** `--since` alone cannot reach older records in a newest-first, row-limited download.
+   `ingest` now has `--until` for bounded windows, counts matching records before downloading (stored in
+   the sidecar; “only N of M downloaded” is reported), and pages with `:id` as a tie-breaker. The
+   insufficient-coverage answer recommends a bounded window. See docs/DATASETS.md.
+
+Verify:
+
+```powershell
+git pull; uv sync --all-extras
+uv run agentic-gis ask --mode local --provider ollama --model qwen2.5:7b -v "Find locations in NYC with repeated illegal dumping complaints"
+#   expect the filter SQL to include incident_address and street_name, and
+#   "Largest cluster: 58 reports over 156 days near 184-54 149 AVENUE, QUEENS."
+uv run agentic-gis ask --mode local --provider ollama --model qwen2.5:7b --narrate -v "Find locations in NYC with repeated illegal dumping complaints"
+#   optional LLM rewrite: compare "narration …s" with the earlier ~118 s; limitations must not mention synthetic data
+uv run agentic-gis ingest nyc_311_sanitation --since 2020-01-01 --until 2020-01-31 --limit 50000
+#   small bounded window: prints the portal's matching count (this REPLACES your stored copy -- skip it if you
+#   want to keep the 2026 data, or register a second dataset as described in docs/DATASETS.md)
 ```
 
 ## Not verified yet (needs your environment)

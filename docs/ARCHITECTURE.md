@@ -68,7 +68,11 @@ flowchart TB
 6. **approve** — `langgraph.types.interrupt()` pauses the graph; the UI shows the SQL; `Command(resume=…)`
    continues. Approved fingerprints are remembered for the session (“newly generated SQL” only).
 7. **execute** — runs steps in order through `ToolRegistry.invoke` (argument validation, error capture,
-   audit logging). Each step records a `reason` (`ok`, `empty_filter`, `empty_result`, `zero_clusters`,
+   audit logging). Structured reads always keep the dataset's location columns (address, street, ZIP,
+   community board, borough; `location_columns` in the registry) and simple LLM `SELECT`s get them added
+   before approval, so results can name places. Repeat-report clusters carry a `location` description
+   (address or street, else center coordinates plus the most specific area, else an area looked up in
+   local reference boundaries) and `center_lat`/`center_lon`. Each step records a `reason` (`ok`, `empty_filter`, `empty_result`, `zero_clusters`,
    `empty_input`, `error`, `dependency_failed`, `missing_input`, `blocked_by_policy`, `needs_approval`,
    `unavailable`). A step whose input has no artifact or zero rows is skipped (tools may opt in with
    `accepts_empty_input`), so an empty selection never surfaces as “Unknown input reference”.
@@ -76,12 +80,16 @@ flowchart TB
    skipped dependents: a new plan cannot create data that is not stored).
 9. **finalize** — chooses the main result, auto-creates a layer if none was requested, builds citations,
    the methodology list, and the data scope (matching vs stored records).
-10. **respond** — template narrative (always computed; explains empty selections, zero clusters and
-    failures by their root cause). The LLM narrates only when there are results; its answer is checked
-    against the computed facts (`grounding.check_narrative`: numbers, years, places, “no records”/“no
-    clusters” claims) and replaced by the template if it contradicts them. Computed caveats are always kept.
-    Then `enforce_guardrails()` (relabels unsupported “verified” findings, rewrites violation claims, adds
-    synthetic/report disclaimers).
+10. **respond** — deterministic answer (always computed; explains empty selections, zero clusters and
+    failures by their root cause; limitations, provenance and coverage notes, follow-up suggestions). LLM
+    narration is optional (`AGIS_LLM_NARRATION`, default off; or per answer via `AgentSession.narrate`, the
+    UI button or `ask --narrate`). The model only rewrites headline, summary and findings from a compact
+    digest of computed facts; its text is checked (`grounding.check_narrative`: numbers, years, places,
+    “no records”/“no clusters” claims, real-vs-synthetic claims against dataset metadata, “period not
+    covered” claims against the request scope and stored coverage, truncation claims against the ingestion
+    record) and discarded if it contradicts them. Limitations are never model-written. Then
+    `enforce_guardrails()` (relabels unsupported “verified” findings, rewrites violation claims, adds
+    synthetic/report disclaimers from metadata).
 
 ## Key design decisions
 
